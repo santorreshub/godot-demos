@@ -12,7 +12,7 @@ Three small Godot 4.3 games written entirely in GDScript, with no imported asset
 
 ## Repo layout
 - `games/` — Godot project for each game (open `project.godot` in Godot 4.3+)
-- `docs/` — web exports served by GitHub Pages
+- `index.html`, `dispatch/`, `flatbed_hauler/`, `ollama/` — web exports served by GitHub Pages
 
 ## Rebuild the web versions
 In each game folder: Godot → Project → Export → Web → Export Project (single-threaded build, so it runs on GitHub Pages without special headers).
