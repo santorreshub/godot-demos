@@ -7,9 +7,13 @@ config/description="Haul steel coils from the mill to the dock without losing an
 run/main_scene="res://main.tscn"
 config/features=PackedStringArray("4.3", "GL Compatibility")
 
+[autoload]
+SFX="*res://sfx.gd"
+
 [display]
 window/size/viewport_width=1280
 window/size/viewport_height=720
+window/stretch/mode="canvas_items"
 
 [physics]
 common/physics_ticks_per_second=120

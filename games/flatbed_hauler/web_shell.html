@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0">
+	<title>$GODOT_PROJECT_NAME</title>
+	<link rel="preconnect" href="https://rsms.me/">
+	<link rel="stylesheet" href="https://rsms.me/inter/inter.css">
+	<style>
+		:root { font-family: 'Inter', system-ui, sans-serif; }
+		html, body, #canvas { margin: 0; padding: 0; border: 0; }
+		body {
+			color: #e6edf6;
+			background: linear-gradient(180deg, #0a1120 0%, #121d31 100%);
+			overflow: hidden;
+			touch-action: none;
+			min-height: 100vh;
+		}
+		#canvas { display: block; }
+		#canvas:focus { outline: none; }
+		#status {
+			position: absolute; inset: 0;
+			display: flex; align-items: center; justify-content: center;
+			background: linear-gradient(180deg, #0a1120 0%, #121d31 100%);
+			z-index: 10;
+		}
+		.boot-card {
+			width: 440px; max-width: calc(100vw - 48px);
+			padding: 28px 32px;
+			background: rgba(255,255,255,0.06);
+			border: 1px solid rgba(255,182,77,0.35);
+			border-radius: 16px;
+			backdrop-filter: blur(14px);
+			-webkit-backdrop-filter: blur(14px);
+			text-align: left;
+		}
+		.boot-eyebrow {
+			font-size: 12px; letter-spacing: 0.1em; text-transform: uppercase;
+			color: #ffb64d; margin: 0 0 10px 0;
+		}
+		.boot-title {
+			font-size: 24px; font-weight: 600; margin: 0 0 6px 0; color: #e6edf6;
+			letter-spacing: -0.01em;
+		}
+		.boot-sub {
+			font-size: 14px; color: #8aa0bb; margin: 0 0 22px 0;
+		}
+		.boot-bar {
+			height: 6px; width: 100%; background: rgba(255,255,255,0.10);
+			border-radius: 3px; overflow: hidden;
+		}
+		.boot-bar-inner {
+			height: 100%; width: 0%;
+			background: linear-gradient(90deg, #ffb64d 0%, #5cc8ff 100%);
+			transition: width 160ms ease-out;
+		}
+		.boot-foot {
+			font-size: 11px; color: #5c6c86; margin-top: 14px;
+			display: flex; justify-content: space-between;
+		}
+		#status-notice {
+			display: none;
+			background: rgba(255, 107, 107, 0.14);
+			border: 1px solid rgba(255, 107, 107, 0.4);
+			color: #ffd0d0;
+			border-radius: 8px;
+			padding: 12px;
+			margin-top: 14px;
+			font-size: 13px;
+			line-height: 1.4;
+		}
+		.boot-dot {
+			display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+			background: #ffb64d; margin-right: 6px; vertical-align: middle;
+			animation: pulse 1.4s ease-in-out infinite;
+		}
+		@keyframes pulse { 0%,100% { opacity: 0.3 } 50% { opacity: 1 } }
+	</style>
+	$GODOT_HEAD_INCLUDE
+</head>
+<body>
+	<canvas id="canvas">
+		Your browser does not support the canvas tag.
+	</canvas>
+	<noscript>Your browser does not support JavaScript.</noscript>
+
+	<div id="status">
+		<div class="boot-card">
+			<p class="boot-eyebrow"><span class="boot-dot"></span>Loading demo</p>
+			<h1 class="boot-title">FLATBED HAULER · Thread the chicane</h1>
+			<p class="boot-sub">Best on desktop. Rolling steel coils, headboard physics, coil racks.</p>
+			<div class="boot-bar"><div class="boot-bar-inner" id="status-bar"></div></div>
+			<div class="boot-foot">
+				<span>Godot 4.3 · GL Compatibility</span>
+				<span id="status-pct">0%</span>
+			</div>
+			<div id="status-notice"></div>
+			<progress id="status-progress" style="display:none"></progress>
+			<img id="status-splash" src="index.png" alt="" style="display:none">
+		</div>
+	</div>
+
+	<script src="$GODOT_URL"></script>
+	<script>
+		const GODOT_CONFIG = $GODOT_CONFIG;
+		const GODOT_THREADS_ENABLED = $GODOT_THREADS_ENABLED;
+		const engine = new Engine(GODOT_CONFIG);
+
+		(function () {
+			const statusOverlay = document.getElementById('status');
+			const statusBar = document.getElementById('status-bar');
+			const statusPct = document.getElementById('status-pct');
+			const statusNotice = document.getElementById('status-notice');
+
+			function setNotice(text) {
+				statusNotice.textContent = text;
+				statusNotice.style.display = 'block';
+			}
+
+			function fail(err) {
+				console.error(err);
+				setNotice(err instanceof Error ? err.message : String(err));
+			}
+
+			const missing = Engine.getMissingFeatures({ threads: GODOT_THREADS_ENABLED });
+			if (missing.length !== 0) {
+				fail('Browser missing required features:\n' + missing.join('\n'));
+				return;
+			}
+
+			engine.startGame({
+				onProgress: function (current, total) {
+					if (current > 0 && total > 0) {
+						const p = Math.round((current / total) * 100);
+						statusBar.style.width = p + '%';
+						statusPct.textContent = p + '%';
+					}
+				},
+			}).then(() => {
+				statusBar.style.width = '100%';
+				statusPct.textContent = '100%';
+				setTimeout(() => {
+					statusOverlay.style.transition = 'opacity 250ms ease-out';
+					statusOverlay.style.opacity = '0';
+					setTimeout(() => statusOverlay.remove(), 300);
+				}, 120);
+			}, fail);
+		}());
+	</script>
+</body>
+</html>
