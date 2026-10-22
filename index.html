@@ -4,73 +4,395 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Santiago Torres · Godot Demos</title>
-<meta name="description" content="Playable Godot 4 demos by Santiago Torres: freight, game AI and physics, running in the browser.">
+<meta name="description" content="Three playable Godot 4 demos by Santiago Torres: a Mesoamerican ballgame, a freight dispatch board against an AI broker, and a 3D flatbed hauler.">
+<meta property="og:title" content="Santiago Torres · Godot Demos">
+<meta property="og:description" content="Three playable Godot 4 demos. All procedural, running in the browser.">
+<link rel="preconnect" href="https://rsms.me/">
+<link rel="stylesheet" href="https://rsms.me/inter/inter.css">
 <style>
-  :root{--bg:#0a1120;--card:#121d31;--edge:#22324d;--ink:#e8eef7;--muted:#9fb2cc;--blue:#5cc8ff;--orange:#ff8a3d}
+  :root{
+    --bg:#0a0b14;
+    --bg-2:#13111f;
+    --ink:#fff3d6;
+    --ink-dim:rgba(255,243,214,0.72);
+    --ink-faint:rgba(255,243,214,0.45);
+    --gold:#f2b632;
+    --jade:#2fb38a;
+    --blue:#5cc8ff;
+    --amber:#ffb64d;
+    --panel:rgba(255,255,255,0.04);
+    --panel-strong:rgba(255,255,255,0.07);
+    --edge:rgba(255,255,255,0.09);
+    --edge-strong:rgba(242,182,50,0.35);
+  }
   *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,"Helvetica Neue",Arial,sans-serif;line-height:1.5}
-  main{max-width:1080px;margin:0 auto;padding:56px 16px 72px}
-  .eyebrow{color:var(--orange);font-weight:700;letter-spacing:.2em;font-size:13px}
-  h1{font-size:clamp(30px,5vw,46px);line-height:1.1;margin:12px 0 14px;letter-spacing:-.01em}
-  h1 span{color:var(--blue)}
-  .lead{color:var(--muted);max-width:680px;margin:0 0 36px;font-size:17px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px}
-  .card{background:var(--card);border:1px solid var(--edge);border-radius:14px;overflow:hidden;display:flex;flex-direction:column;text-decoration:none;color:inherit;transition:transform .15s,border-color .15s}
-  .card:hover{transform:translateY(-3px);border-color:var(--blue)}
-  .card img{width:100%;aspect-ratio:16/9;object-fit:cover;display:block;background:#0e1726}
-  .body{padding:18px 18px 20px;display:flex;flex-direction:column;gap:8px;flex:1}
-  .tag{font-size:12px;color:var(--blue);font-weight:600;letter-spacing:.06em;text-transform:uppercase}
-  h2{margin:0;font-size:21px}
-  p{margin:0;color:var(--muted);font-size:15px}
-  .keys{margin-top:auto;padding-top:10px;font-size:13px;color:var(--ink);opacity:.8}
-  .play{display:inline-block;margin-top:12px;color:var(--bg);background:var(--blue);font-weight:700;padding:8px 14px;border-radius:8px;width:max-content}
-  footer{margin-top:44px;color:var(--muted);font-size:14px}
-  footer a{color:var(--blue)}
-  .note{margin-top:8px;font-size:13px}
+  html,body{margin:0;padding:0}
+  body{
+    background:
+      radial-gradient(ellipse 90% 60% at 70% -10%, rgba(242,182,50,0.14), transparent 60%),
+      radial-gradient(ellipse 60% 50% at 10% 20%, rgba(47,179,138,0.08), transparent 60%),
+      linear-gradient(180deg, var(--bg) 0%, var(--bg-2) 100%);
+    background-attachment:fixed;
+    color:var(--ink);
+    font-family:'Inter', system-ui, -apple-system, sans-serif;
+    font-feature-settings:'ss01','cv11';
+    line-height:1.55;
+    min-height:100vh;
+    overflow-x:hidden;
+  }
+
+  /* Faint grid — gives the page a mechanical floor */
+  body::before{
+    content:"";
+    position:fixed; inset:0;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px);
+    background-size:48px 48px;
+    pointer-events:none;
+    mask-image:radial-gradient(ellipse 70% 50% at 50% 20%, black, transparent 80%);
+    z-index:0;
+  }
+
+  main{
+    position:relative; z-index:1;
+    max-width:1180px;
+    margin:0 auto;
+    padding:40px 24px 80px;
+  }
+
+  /* Top bar */
+  .top{
+    display:flex; justify-content:space-between; align-items:center;
+    font-size:13px; color:var(--ink-dim); letter-spacing:0.02em;
+    margin-bottom:84px;
+  }
+  .top .brand{font-weight:600; color:var(--ink); letter-spacing:0.01em}
+  .top .brand .dot{display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--gold); margin-right:10px; vertical-align:middle; box-shadow:0 0 14px rgba(242,182,50,0.6)}
+  .top nav{display:flex; gap:22px}
+  .top nav a{color:var(--ink-dim); text-decoration:none; transition:color 0.15s}
+  .top nav a:hover{color:var(--ink)}
+
+  /* Hero */
+  .hero{margin-bottom:88px}
+  .eyebrow{
+    display:inline-flex; align-items:center; gap:10px;
+    font-size:11px; letter-spacing:0.22em; text-transform:uppercase;
+    color:var(--gold); font-weight:600;
+    padding:7px 14px; border-radius:999px;
+    background:rgba(242,182,50,0.08);
+    border:1px solid rgba(242,182,50,0.25);
+  }
+  h1{
+    font-size:clamp(42px, 7vw, 88px);
+    line-height:0.98;
+    letter-spacing:-0.025em;
+    font-weight:700;
+    margin:22px 0 20px;
+  }
+  h1 .accent{
+    background:linear-gradient(100deg, var(--gold) 0%, #ffe6a0 50%, var(--jade) 100%);
+    -webkit-background-clip:text; background-clip:text; color:transparent;
+  }
+  .lead{
+    max-width:680px;
+    font-size:clamp(16px, 1.5vw, 19px);
+    color:var(--ink-dim);
+    margin:0 0 28px;
+  }
+  .meta-row{
+    display:flex; flex-wrap:wrap; gap:10px; align-items:center;
+    font-size:12px; letter-spacing:0.08em; text-transform:uppercase;
+    color:var(--ink-faint);
+  }
+  .meta-chip{
+    padding:6px 12px; border-radius:999px;
+    background:var(--panel); border:1px solid var(--edge);
+    color:var(--ink-dim); font-weight:500;
+  }
+
+  /* Section header */
+  .section-head{
+    display:flex; justify-content:space-between; align-items:baseline;
+    margin:0 0 24px;
+  }
+  .section-head .label{
+    font-size:11px; letter-spacing:0.22em; text-transform:uppercase;
+    color:var(--ink-faint); font-weight:600;
+  }
+  .section-head .count{
+    font-size:12px; color:var(--ink-faint); font-feature-settings:'tnum';
+  }
+
+  /* Grid */
+  .grid{
+    display:grid;
+    grid-template-columns:1.4fr 1fr 1fr;
+    gap:18px;
+  }
+  @media (max-width: 980px){
+    .grid{grid-template-columns:1fr}
+  }
+
+  /* Card */
+  .card{
+    position:relative;
+    display:flex; flex-direction:column;
+    text-decoration:none; color:inherit;
+    border-radius:18px;
+    background:var(--panel-strong);
+    border:1px solid var(--edge);
+    overflow:hidden;
+    transition:transform 0.25s cubic-bezier(.2,.8,.2,1), border-color 0.25s, box-shadow 0.25s;
+    backdrop-filter:blur(6px);
+    -webkit-backdrop-filter:blur(6px);
+  }
+  .card:hover{
+    transform:translateY(-4px);
+    border-color:var(--edge-strong);
+    box-shadow:0 20px 60px -24px rgba(242,182,50,0.25), 0 0 0 1px rgba(242,182,50,0.15);
+  }
+  .card .thumb{
+    position:relative;
+    aspect-ratio:16/10;
+    overflow:hidden;
+    background:#0e1726;
+  }
+  .card .thumb img{
+    width:100%; height:100%; object-fit:cover; display:block;
+    transition:transform 0.5s cubic-bezier(.2,.8,.2,1);
+  }
+  .card:hover .thumb img{transform:scale(1.04)}
+  .card .thumb::after{
+    content:""; position:absolute; inset:0;
+    background:linear-gradient(180deg, transparent 50%, rgba(10,11,20,0.65) 100%);
+    pointer-events:none;
+  }
+  .card .num{
+    position:absolute; top:12px; left:14px;
+    font-size:11px; letter-spacing:0.14em; color:var(--ink);
+    background:rgba(10,11,20,0.6);
+    border:1px solid var(--edge);
+    padding:4px 10px; border-radius:999px;
+    font-weight:600;
+    backdrop-filter:blur(6px);
+    -webkit-backdrop-filter:blur(6px);
+    z-index:1;
+  }
+  .card .badge{
+    position:absolute; top:12px; right:14px;
+    font-size:10px; letter-spacing:0.18em; text-transform:uppercase;
+    color:var(--gold); font-weight:700;
+    background:rgba(242,182,50,0.12);
+    border:1px solid rgba(242,182,50,0.5);
+    padding:5px 10px; border-radius:999px;
+    z-index:1;
+  }
+  .card .body{
+    padding:22px 22px 22px;
+    display:flex; flex-direction:column; gap:12px;
+    flex:1;
+  }
+  .card .tag{
+    font-size:11px; letter-spacing:0.14em; text-transform:uppercase;
+    color:var(--jade); font-weight:600;
+  }
+  .card.flag .tag{color:var(--gold)}
+  .card h2{
+    margin:0;
+    font-size:22px; font-weight:600; letter-spacing:-0.01em;
+    color:var(--ink);
+  }
+  .card.flag h2{font-size:28px}
+  .card p{
+    margin:0;
+    color:var(--ink-dim); font-size:14.5px;
+  }
+  .keys{
+    margin-top:auto;
+    display:flex; flex-wrap:wrap; gap:6px;
+    padding-top:12px;
+  }
+  .key{
+    font-size:10.5px; letter-spacing:0.08em;
+    color:var(--ink-dim);
+    background:rgba(255,255,255,0.04);
+    border:1px solid var(--edge);
+    padding:4px 8px; border-radius:6px;
+    font-family:'Inter', monospace;
+    font-feature-settings:'tnum';
+  }
+  .play-row{
+    display:flex; justify-content:space-between; align-items:center;
+    margin-top:14px;
+  }
+  .play{
+    display:inline-flex; align-items:center; gap:8px;
+    font-weight:600; font-size:14px;
+    color:var(--gold);
+    transition:gap 0.2s;
+  }
+  .card:hover .play{gap:12px}
+  .play::after{content:"→"; font-size:16px}
+  .stack{
+    font-size:11px; letter-spacing:0.08em;
+    color:var(--ink-faint); font-feature-settings:'tnum';
+  }
+
+  /* Footer / about */
+  .about{
+    margin-top:88px;
+    padding:36px;
+    border-radius:20px;
+    background:var(--panel);
+    border:1px solid var(--edge);
+    display:grid; grid-template-columns:2fr 1fr; gap:48px;
+  }
+  @media (max-width: 760px){
+    .about{grid-template-columns:1fr; gap:24px; padding:24px}
+  }
+  .about h3{
+    margin:0 0 12px;
+    font-size:11px; letter-spacing:0.22em; text-transform:uppercase;
+    color:var(--ink-faint); font-weight:600;
+  }
+  .about p{margin:0 0 10px; color:var(--ink-dim); font-size:15px}
+  .about a{color:var(--gold); text-decoration:none; border-bottom:1px solid rgba(242,182,50,0.3); transition:border-color 0.15s}
+  .about a:hover{border-color:var(--gold)}
+  .about ul{list-style:none; padding:0; margin:0; display:flex; flex-direction:column; gap:10px}
+  .about li{font-size:14px; color:var(--ink-dim); display:flex; justify-content:space-between; gap:16px}
+  .about li span:first-child{color:var(--ink)}
+
+  footer{
+    margin-top:40px; padding:24px 4px;
+    display:flex; justify-content:space-between; align-items:center;
+    font-size:12px; color:var(--ink-faint); letter-spacing:0.04em;
+    border-top:1px solid var(--edge);
+  }
+  footer a{color:var(--ink-dim); text-decoration:none}
+  footer a:hover{color:var(--ink)}
+
+  @media (max-width: 500px){
+    .top nav{display:none}
+    .meta-row{font-size:10.5px}
+  }
 </style>
 </head>
 <body>
 <main>
-  <div class="eyebrow">GODOT 4 · PLAYABLE IN YOUR BROWSER</div>
-  <h1>Santiago Torres<br><span>Game demos</span></h1>
-  <p class="lead">Small Godot 4 projects built entirely in GDScript, no imported assets. Freight, game AI and physics, grounded in real work hauling steel across North America.</p>
+  <div class="top">
+    <div class="brand"><span class="dot"></span>Santiago Torres · Godot demos</div>
+    <nav>
+      <a href="https://github.com/santorreshub/godot-demos">Source</a>
+      <a href="https://www.linkedin.com/in/santorreswork">LinkedIn</a>
+    </nav>
+  </div>
+
+  <section class="hero">
+    <span class="eyebrow">Godot 4 · playable in your browser</span>
+    <h1>Three demos.<br><span class="accent">All procedural.</span></h1>
+    <p class="lead">
+      Small Godot 4 projects built entirely in GDScript. No imported art, no store assets, no shaders borrowed from the internet. A Mesoamerican ballgame, a freight dispatch board against an AI broker, and a 3D flatbed hauler, grounded in real work moving steel across North America.
+    </p>
+    <div class="meta-row">
+      <span class="meta-chip">GDScript 4.3</span>
+      <span class="meta-chip">GL Compatibility · Web</span>
+      <span class="meta-chip">Procedural audio</span>
+      <span class="meta-chip">2026</span>
+    </div>
+  </section>
+
+  <div class="section-head">
+    <span class="label">Playable</span>
+    <span class="count">01 — 03</span>
+  </div>
 
   <div class="grid">
-    <a class="card" href="dispatch/">
-      <img src="thumbs/dispatch.png" alt="Dispatch load board with trucks on a North America map">
-      <div class="body">
-        <div class="tag">2D · Strategy · Game AI</div>
-        <h2>Dispatch: Beat the AI Broker</h2>
-        <p>Run a cross-border load board against a utility-AI broker that scores every truck and load by profit per mile and explains its picks.</p>
-        <div class="keys">Click a load, then your truck (or 1/2/3) · Enter restarts</div>
-        <span class="play">Play</span>
+    <a class="card flag" href="ollama/">
+      <div class="thumb">
+        <span class="num">01</span>
+        <span class="badge">Flagship</span>
+        <img src="thumbs/ollama.png" alt="Mesoamerican ballgame court at dusk">
       </div>
-    </a>
-    <a class="card" href="flatbed_hauler/">
-      <img src="thumbs/flatbed_hauler.png" alt="Flatbed truck carrying steel coils">
       <div class="body">
-        <div class="tag">3D · Driving · Physics</div>
-        <h2>Flatbed Hauler</h2>
-        <p>Get four steel coils to the dock before time runs out. Brake hard and they roll; set coil racks and lose five seconds.</p>
-        <div class="keys">W/S drive · A/D steer · Space brake · R racks · Enter restarts</div>
-        <span class="play">Play</span>
-      </div>
-    </a>
-    <a class="card" href="ollama/">
-      <img src="thumbs/ollama.png" alt="Mesoamerican ballgame court at dusk">
-      <div class="body">
-        <div class="tag">2D · Arcade · Physics</div>
+        <span class="tag">2D · Rhythm · Physics</span>
         <h2>Ōllamaliztli</h2>
-        <p>The Mesoamerican ballgame. Keep the rubber ball up with your hips and thread it through the stone ring.</p>
-        <div class="keys">A/D move · W jump · J hip strike · Enter restarts</div>
-        <span class="play">Play</span>
+        <p>The Mesoamerican ballgame. Hips only. 90ms perfect-timing window, ×5 combo multiplier, slow-mo rings. Three modes, procedural dusk court.</p>
+        <div class="keys">
+          <span class="key">A / D move</span>
+          <span class="key">W jump</span>
+          <span class="key">J strike</span>
+        </div>
+        <div class="play-row">
+          <span class="play">Play</span>
+          <span class="stack">~700 LOC · 4.3</span>
+        </div>
+      </div>
+    </a>
+
+    <a class="card" href="dispatch/">
+      <div class="thumb">
+        <span class="num">02</span>
+        <img src="thumbs/dispatch.png" alt="Dispatch load board with trucks on a North America map">
+      </div>
+      <div class="body">
+        <span class="tag">2D · Strategy · Game AI</span>
+        <h2>Dispatch</h2>
+        <p>Beat the AI broker. Utility-AI scores every (truck, load) pair in real time and explains its picks on a sortable load board.</p>
+        <div class="keys">
+          <span class="key">Click load</span>
+          <span class="key">1 / 2 / 3</span>
+        </div>
+        <div class="play-row">
+          <span class="play">Play</span>
+          <span class="stack">~1200 LOC · 4.3</span>
+        </div>
+      </div>
+    </a>
+
+    <a class="card" href="flatbed_hauler/">
+      <div class="thumb">
+        <span class="num">03</span>
+        <img src="thumbs/flatbed_hauler.png" alt="Flatbed truck carrying steel coils">
+      </div>
+      <div class="body">
+        <span class="tag">3D · Driving · Physics</span>
+        <h2>Flatbed Hauler</h2>
+        <p>Haul four steel coils to the dock before the clock runs out. Brake hard and they roll. Set racks and lose five seconds.</p>
+        <div class="keys">
+          <span class="key">W / S drive</span>
+          <span class="key">Space brake</span>
+          <span class="key">R racks</span>
+        </div>
+        <div class="play-row">
+          <span class="play">Play</span>
+          <span class="stack">~500 LOC · 4.3</span>
+        </div>
       </div>
     </a>
   </div>
 
+  <section class="about">
+    <div>
+      <h3>About</h3>
+      <p>Written by Santiago Torres, software engineer and freight broker. Everything you see is drawn or synthesized at runtime, from the Inter type to the court glyphs to the AudioStreamGenerator SFX. The code is MIT.</p>
+      <p>Reach out: <a href="https://www.linkedin.com/in/santorreswork">LinkedIn</a> · <a href="https://github.com/santorreshub/godot-demos">Source on GitHub</a></p>
+    </div>
+    <div>
+      <h3>Under the hood</h3>
+      <ul>
+        <li><span>Engine</span><span>Godot 4.3 stable</span></li>
+        <li><span>Renderer</span><span>GL Compatibility</span></li>
+        <li><span>Threads</span><span>Single, GH Pages</span></li>
+        <li><span>Assets</span><span>Procedural</span></li>
+        <li><span>Fonts</span><span>Inter OFL only</span></li>
+      </ul>
+    </div>
+  </section>
+
   <footer>
-    Built by Santiago Torres · <a href="https://www.linkedin.com/in/santorreswork">LinkedIn</a> · <a href="https://github.com/santorreshub/godot-demos">Source on GitHub</a>
-    <div class="note">Best on desktop with a keyboard. First load downloads the engine (~35 MB).</div>
+    <span>Best on desktop with a keyboard. First load pulls the engine (~35 MB).</span>
+    <span>© 2026 Santiago Torres</span>
   </footer>
 </main>
 </body>
