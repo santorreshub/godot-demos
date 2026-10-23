@@ -1,13 +1,29 @@
 extends Node3D
-## FLATBED HAULER — supporting portfolio demo.
-## Four steel coils from the mill to the dock. Rolling physics, coil racks,
-## headboard. Reuses the shared ui_kit + sfx autoload + Inter fonts.
+## FLATBED HAULER v2 — Dynamo portfolio.
+## Haul steel from the mill to the dock. Rolling physics, cargo racks,
+## cliff road, arcade high-score table. Shared ui_kit + sfx autoload.
 
 const UI = preload("res://ui_kit.gd")
 
-enum State { TITLE, HOW_TO, PLAY, PAUSE, SETTINGS, RESULTS }
+enum State { TITLE, HOW_TO, PLAY, PAUSE, SETTINGS, RESULTS, SCORES, NAME_ENTRY }
 
+# Cargo kinds
+const CARGO_COILS := "coils"
+const CARGO_PIPES := "pipes"
+
+# Coil layout (across-deck cylinders, roll fore/aft)
 const COIL_Z := [1.2, -0.4, -2.0, -3.6]
+const COIL_RADIUS := 0.7
+const COIL_HEIGHT := 1.2
+const COIL_MASS := 250.0
+
+# Pipe layout (lengthwise cylinders, roll side to side)
+const PIPE_X := [-0.75, 0.0, 0.75]
+const PIPE_Z_CENTER := -1.1
+const PIPE_RADIUS := 0.3
+const PIPE_LENGTH := 5.0
+const PIPE_MASS := 180.0
+
 const DOCK_POS := Vector3(0, 0, -260)
 const ENGINE_FORCE := 5000.0
 const BRAKE_FORCE := 40.0
@@ -16,11 +32,13 @@ const MAX_STEER := 0.45
 const BRAKE_COYOTE := 0.06
 const DELIVERY_TIME := 1.2
 const CLEAN_STOP_DECEL := 8.0
+const FALL_KILL_Y := -4.0
+const ROAD_HALF_WIDTH := 11.0  # 22m wide road platform
 
 const MODES := [
 	{"name": "Yard",     "time": 180.0, "par": 90.0, "friction": 2.5, "chicane": false, "wind": 0.0, "subtitle": "180s · teaches"},
 	{"name": "Haul",     "time": 120.0, "par": 70.0, "friction": 2.5, "chicane": true,  "wind": 0.0, "subtitle": "120s · the shift"},
-	{"name": "Night Run","time": 120.0, "par": 70.0, "friction": 1.8, "chicane": true,  "wind": 7.0, "subtitle": "120s · low grip, crosswind"},
+	{"name": "Night Run","time": 120.0, "par": 70.0, "friction": 1.8, "chicane": true,  "wind": 7.0, "subtitle": "120s · low grip"},
 ]
 
 # Palette
@@ -33,12 +51,13 @@ const SKY := Color("5cc8ff")
 
 # Scene nodes
 var truck: VehicleBody3D
-var coils: Array[RigidBody3D] = []
-var coil_mats: Array[StandardMaterial3D] = []
+var cargo: Array[RigidBody3D] = []
+var cargo_mats: Array[StandardMaterial3D] = []
 var lost: Dictionary = {}
 var delivered: Dictionary = {}
 var chock_shapes: Array[CollisionShape3D] = []
 var chock_meshes: Array[MeshInstance3D] = []
+var cradle_nodes: Array[Node] = []  # permanent cradles + backstops, cleared on cargo swap
 var racks_on := false
 var cam: Camera3D
 var sun: DirectionalLight3D
@@ -67,10 +86,13 @@ var state: int = State.TITLE
 var state_prev: int = State.TITLE
 var settings: Dictionary = {}
 var best_cfg: Dictionary = {}
+var scores_cfg: Dictionary = {}  # key route%d_%s -> Array[{name, score, cargo, racks, time}]
 var mode_ix: int = 1
+var cargo_kind: String = CARGO_COILS
 var _buttons: Array = []
 var first_input_received := false
 var controls_fade_t := 0.0
+var mouse_pos := Vector2(-1000, -1000)
 
 # Match
 var time_left := 0.0
@@ -78,11 +100,20 @@ var finished := false
 var game_over := false
 var grade := 1
 var par_hit := false
-var start_time := 0.0
 var elapsed := 0.0
 var clean_stops := 0
 var delivery_t := 0.0
 var in_dock := false
+var racks_at_finish := false
+var final_score := 0
+var final_rank := -1
+
+# Name entry
+var name_letters: Array[int] = [0, 0, 0]  # 0=A ... 25=Z
+var name_pos: int = 0
+
+# Pending finish-to-results transition (cancelable on restart)
+var finish_timer_id: int = 0
 
 # Game-feel
 var shake := 0.0
@@ -96,6 +127,7 @@ var prev_speed := 0.0
 var brake_coyote_t := 0.0
 var prev_racks_on := false
 var rng := RandomNumberGenerator.new()
+var reset_grace_t := 0.0  # seconds; fall detect + lost checks ignored while > 0
 
 # View
 const VIEW := Vector2(1280, 720)
@@ -114,11 +146,13 @@ func _ready() -> void:
 	SFX.set_muted(settings.mute)
 	_setup_input()
 	best_cfg = _load_best()
+	scores_cfg = _load_scores()
 	mode_ix = int(best_cfg.get("last_mode", 1))
+	cargo_kind = String(best_cfg.get("last_cargo", CARGO_COILS))
 	_build_environment()
 	_build_world()
 	truck = _build_truck()
-	_spawn_coils()
+	_spawn_cargo()
 	_set_racks(false)
 	_build_camera()
 	_build_hud()
@@ -215,8 +249,8 @@ func _build_environment() -> void:
 	var sm := ProceduralSkyMaterial.new()
 	sm.sky_top_color = Color(0.18, 0.22, 0.42)
 	sm.sky_horizon_color = Color(0.95, 0.55, 0.35)
-	sm.ground_horizon_color = Color(0.75, 0.42, 0.3)
-	sm.ground_bottom_color = Color(0.14, 0.11, 0.1)
+	sm.ground_horizon_color = Color(0.42, 0.28, 0.22)
+	sm.ground_bottom_color = Color(0.08, 0.06, 0.05)
 	sm.sun_angle_max = 20.0
 	sky.sky_material = sm
 	env.sky = sky
@@ -243,39 +277,56 @@ func _build_environment() -> void:
 
 
 func _build_world() -> void:
-	# Ground + road
-	_static_box(Vector3(400, 1, 700), Vector3(0, -0.5, -200), Color(0.26, 0.22, 0.18))
+	# Narrow road platform (cliff on both sides)
+	var road_w: float = ROAD_HALF_WIDTH * 2.0
+	_static_box(Vector3(road_w, 1, 310), Vector3(0, -0.5, -125), Color(0.26, 0.22, 0.18))
+	# Shoulder stripes (edge of road, keep below truck wheels)
+	for s in [-ROAD_HALF_WIDTH + 0.15, ROAD_HALF_WIDTH - 0.15]:
+		_box_mesh(Vector3(0.3, 0.02, 300), Vector3(s, 0.01, -125), Color(0.9, 0.9, 0.9), self)
+	# Center lane markings
 	_box_mesh(Vector3(14, 0.02, 290), Vector3(0, 0.01, -125), Color(0.12, 0.12, 0.14), self)
 	for i in range(28):
 		_box_mesh(Vector3(0.25, 0.03, 4), Vector3(0, 0.02, 5 - i * 10.0), Color(0.95, 0.75, 0.2), self)
 
-	# Steel mill at the start
+	# Cliff-side rail poles — occasional, breaks the horizon line
+	for z in range(-20, -260, -40):
+		for sx in [-ROAD_HALF_WIDTH + 0.4, ROAD_HALF_WIDTH - 0.4]:
+			_box_mesh(Vector3(0.2, 1.2, 0.2), Vector3(sx, 0.6, z), Color(0.35, 0.33, 0.3), self)
+
+	# Mill zone — wider platform at the start
+	_static_box(Vector3(44, 1, 32), Vector3(0, -0.5, 24), Color(0.26, 0.22, 0.18))
 	_static_box(Vector3(40, 18, 14), Vector3(0, 9, 26), Color(0.3, 0.28, 0.28))
 	_static_box(Vector3(3, 30, 3), Vector3(-14, 15, 30), Color(0.4, 0.3, 0.26))
 	_static_box(Vector3(3, 26, 3), Vector3(-8, 13, 30), Color(0.4, 0.3, 0.26))
-	# Mill marker lamp
 	_box_mesh(Vector3(2.5, 0.5, 2.5), Vector3(-14, 30.3, 30), AMBER, self, 0.0, true)
 	mill_sign = _sign_label("STEEL MILL", Vector3(0, 20, 18), 160, AMBER)
 
 	# Speed bumps
 	for z in [-35.0, -80.0, -170.0, -215.0]:
-		_static_box(Vector3(14, 0.35, 1.2), Vector3(0, 0.1, z), Color(0.95, 0.75, 0.15))
+		_static_box(Vector3(road_w, 0.35, 1.2), Vector3(0, 0.1, z), Color(0.95, 0.75, 0.15))
 
 	# Jersey-barrier chicane
 	var side := 1.0
 	for z in range(-105, -150, -12):
-		var b := _static_box(Vector3(8, 1.2, 0.8), Vector3(3.2 * side, 0.6, z), Color(0.82, 0.82, 0.8))
+		var b := _static_box(Vector3(6, 1.2, 0.8), Vector3(2.6 * side, 0.6, z), Color(0.82, 0.82, 0.8))
 		chicane_bodies.append(b)
 		side = -side
 
-	# Scenery
+	# Mesa scenery (far side of the void)
 	var r := RandomNumberGenerator.new()
 	r.seed = 7
-	for i in range(60):
-		var x := r.randf_range(14, 120) * (1 if r.randf() > 0.5 else -1)
-		var z := r.randf_range(-320, 10)
-		var h := r.randf_range(2, 9)
-		_box_mesh(Vector3(r.randf_range(2, 6), h, r.randf_range(2, 6)), Vector3(x, h / 2, z), Color(0.22, 0.19, 0.17).lerp(Color(0.4, 0.28, 0.22), r.randf()), self)
+	for i in range(28):
+		var sign_x: float = 1.0 if r.randf() > 0.5 else -1.0
+		var x: float = r.randf_range(28, 90) * sign_x
+		var z: float = r.randf_range(-300, 10)
+		var h: float = r.randf_range(4, 14)
+		# Mesa: anchor top below road level to read as distant land past the cliff.
+		var top_y: float = r.randf_range(-6.0, -2.0)
+		var sz := Vector3(r.randf_range(3, 8), h, r.randf_range(3, 8))
+		_box_mesh(sz, Vector3(x, top_y - h * 0.5, z), Color(0.22, 0.19, 0.17).lerp(Color(0.4, 0.28, 0.22), r.randf()), self)
+
+	# Dock platform
+	_static_box(Vector3(32, 1, 32), DOCK_POS + Vector3(0, -0.5, -4), Color(0.26, 0.22, 0.18))
 
 	# Delivery dock pad (solid)
 	var pad := MeshInstance3D.new()
@@ -300,12 +351,11 @@ func _build_world() -> void:
 
 	# Dock warehouse behind the pad
 	_static_box(Vector3(24, 6, 6), DOCK_POS + Vector3(0, 3, -14), Color(0.22, 0.26, 0.34))
-	# Side marker lamps around the dock
 	for sx in [-9.0, 9.0]:
 		_box_mesh(Vector3(0.6, 0.6, 0.6), DOCK_POS + Vector3(sx, 1.0, 0), DOCK_GREEN, self, 0.0, true)
 	dock_sign = _sign_label("DOCK", DOCK_POS + Vector3(0, 9, -10), 160, DOCK_GREEN)
 
-	# "DELIVERED" burst label (hidden until delivery)
+	# "DELIVERED" burst label
 	delivered_label = Label3D.new()
 	delivered_label.text = "DELIVERED"
 	delivered_label.font = font_bold
@@ -328,7 +378,6 @@ func _build_truck() -> VehicleBody3D:
 	v.position = Vector3(0, 0.7, 0)
 	v.rotation_degrees = Vector3(0, 180, 0)
 
-	# Chassis / deck
 	var deck := CollisionShape3D.new()
 	var deck_box := BoxShape3D.new()
 	deck_box.size = Vector3(2.5, 0.5, 9.0)
@@ -338,7 +387,6 @@ func _build_truck() -> VehicleBody3D:
 	_box_mesh(Vector3(2.5, 0.5, 9.0), Vector3(0, 0.6, 0), Color(0.17, 0.18, 0.2), v, 0.4)
 	_box_mesh(Vector3(2.52, 0.08, 6.8), Vector3(0, 0.86, -1.1), Color(0.38, 0.26, 0.17), v)
 
-	# Cab
 	var cab := CollisionShape3D.new()
 	var cab_box := BoxShape3D.new()
 	cab_box.size = Vector3(2.5, 2.1, 2.2)
@@ -348,7 +396,6 @@ func _build_truck() -> VehicleBody3D:
 	_box_mesh(Vector3(2.5, 2.1, 2.2), Vector3(0, 1.9, 3.4), Color(0.7, 0.11, 0.09), v, 0.3)
 	_box_mesh(Vector3(2.3, 0.8, 0.05), Vector3(0, 2.3, 4.51), Color(0.12, 0.2, 0.3), v, 0.6)
 
-	# Headboard
 	var head := CollisionShape3D.new()
 	var head_box := BoxShape3D.new()
 	head_box.size = Vector3(2.5, 1.8, 0.2)
@@ -356,37 +403,12 @@ func _build_truck() -> VehicleBody3D:
 	head.position = Vector3(0, 1.75, 2.2)
 	v.add_child(head)
 	_box_mesh(Vector3(2.5, 1.8, 0.2), Vector3(0, 1.75, 2.2), Color(0.25, 0.26, 0.3), v, 0.5)
-	# Amber marker lights on the headboard top
 	for mx in [-1.0, 1.0]:
 		var m := _box_mesh(Vector3(0.3, 0.15, 0.3), Vector3(mx, 2.7, 2.2), AMBER, v, 0.0, true)
 		marker_lights.append(m)
 
-	# Red tail marker lights on deck rear
 	for mx in [-1.1, 1.1]:
 		_box_mesh(Vector3(0.3, 0.2, 0.1), Vector3(mx, 0.85, -4.6), LOST_RED, v, 0.0, true)
-
-	# Permanent low cradles
-	for z in COIL_Z:
-		for dz in [0.42, -0.42]:
-			var lip := CollisionShape3D.new()
-			var lb := BoxShape3D.new()
-			lb.size = Vector3(2.0, 0.1, 0.1)
-			lip.shape = lb
-			lip.position = Vector3(0, 0.9, z + dz)
-			v.add_child(lip)
-			_box_mesh(lb.size, lip.position, Color(0.09, 0.09, 0.09), v, 0.5)
-
-	# Coil racks (chocks)
-	for z in COIL_Z:
-		for dz in [0.75, -0.75]:
-			var cs := CollisionShape3D.new()
-			var cb := BoxShape3D.new()
-			cb.size = Vector3(2.0, 0.35, 0.25)
-			cs.shape = cb
-			cs.position = Vector3(0, 1.025, z + dz)
-			v.add_child(cs)
-			chock_shapes.append(cs)
-			chock_meshes.append(_box_mesh(cb.size, cs.position, AMBER, v))
 
 	# Wheels
 	var wheel_data := [
@@ -422,10 +444,6 @@ func _build_truck() -> VehicleBody3D:
 		v.add_child(w)
 		wheels.append(w)
 
-	# Headlights (two SpotLight3Ds on the cab, forward = cab local -Z before 180° rotation,
-	# but after the chassis 180° yaw, forward is still local -Z of the truck body which points along world -Z).
-	# Actually: a VehicleBody3D defaults to driving along +Z; we rotated 180°, so "forward" is now its local -Z.
-	# A SpotLight3D emits along local -Z. So pointing it along the truck's local -Z shines forward.
 	for sx in [-0.9, 0.9]:
 		var sp := SpotLight3D.new()
 		sp.position = Vector3(sx, 1.4, 4.3)
@@ -434,15 +452,11 @@ func _build_truck() -> VehicleBody3D:
 		sp.spot_range = 60.0
 		sp.spot_angle = 42.0
 		sp.spot_angle_attenuation = 0.4
-		# Truck is yawed 180° on Y; motion runs along the body's local +Z.
-		# SpotLight3D emits along local -Z, so yaw it 180° to point forward.
 		sp.rotation_degrees = Vector3(-8, 180, 0)
 		v.add_child(sp)
 		headlights.append(sp)
-		# Lens disc on the cab
 		_box_mesh(Vector3(0.4, 0.3, 0.05), Vector3(sx, 1.4, 4.51), Color(1.0, 0.95, 0.78), v, 0.0, true)
 
-	# Dust emitters behind rear axles
 	dust_l = _make_dust()
 	dust_l.position = Vector3(-1.25, 0.1, -3.6)
 	v.add_child(dust_l)
@@ -482,10 +496,49 @@ func _make_dust() -> CPUParticles3D:
 	return p
 
 
+# ============================================================= cargo
+# A single system that spawns coils OR pipes and builds the matching racks
+# attached to the truck. Call _despawn_cargo() first to tear down the old set.
+
+func _despawn_cargo() -> void:
+	for c in cargo:
+		if is_instance_valid(c):
+			c.queue_free()
+	cargo.clear()
+	cargo_mats.clear()
+	# Remove racks (chocks) from the truck. Must also free the collision shapes
+	# we parented onto the truck in _build_racks().
+	for s in chock_shapes:
+		if is_instance_valid(s):
+			s.queue_free()
+	for m in chock_meshes:
+		if is_instance_valid(m):
+			m.queue_free()
+	for n in cradle_nodes:
+		if is_instance_valid(n):
+			n.queue_free()
+	chock_shapes.clear()
+	chock_meshes.clear()
+	cradle_nodes.clear()
+	racks_on = false
+
+
+func _spawn_cargo() -> void:
+	# Build permanent low cradles (visible for both cargos; non-colliding visual)
+	# and spawn either coils or pipes with their matching racks.
+	_despawn_cargo()
+	if cargo_kind == CARGO_PIPES:
+		_spawn_pipes()
+	else:
+		_spawn_coils()
+	_build_racks()
+	_set_racks(false)
+
+
 func _spawn_coils() -> void:
 	for z in COIL_Z:
 		var c := RigidBody3D.new()
-		c.mass = 250.0
+		c.mass = COIL_MASS
 		var pm := PhysicsMaterial.new()
 		pm.friction = 0.8
 		pm.bounce = 0.05
@@ -496,30 +549,29 @@ func _spawn_coils() -> void:
 
 		var cs := CollisionShape3D.new()
 		var shape := CylinderShape3D.new()
-		shape.radius = 0.7
-		shape.height = 1.2
+		shape.radius = COIL_RADIUS
+		shape.height = COIL_HEIGHT
 		cs.shape = shape
 		cs.rotation_degrees = Vector3(0, 0, 90)
 		c.add_child(cs)
 
 		var outer := MeshInstance3D.new()
 		var om := CylinderMesh.new()
-		om.top_radius = 0.7
-		om.bottom_radius = 0.7
-		om.height = 1.2
+		om.top_radius = COIL_RADIUS
+		om.bottom_radius = COIL_RADIUS
+		om.height = COIL_HEIGHT
 		var outer_mat := _mat(STEEL, 0.9)
 		om.material = outer_mat
 		outer.mesh = om
 		outer.rotation_degrees = Vector3(0, 0, 90)
-		outer.name = "Outer"
 		c.add_child(outer)
-		coil_mats.append(outer_mat)
+		cargo_mats.append(outer_mat)
 
 		var eye := MeshInstance3D.new()
 		var em := CylinderMesh.new()
 		em.top_radius = 0.28
 		em.bottom_radius = 0.28
-		em.height = 1.22
+		em.height = COIL_HEIGHT + 0.02
 		em.material = _mat(Color(0.06, 0.06, 0.07))
 		eye.mesh = em
 		eye.rotation_degrees = Vector3(0, 0, 90)
@@ -527,28 +579,158 @@ func _spawn_coils() -> void:
 
 		c.position = truck.transform * Vector3(0, 1.57, z)
 		add_child(c)
-		coils.append(c)
+		cargo.append(c)
 
 
-func _reset_coils() -> void:
-	for i in range(coils.size()):
-		var c := coils[i]
+func _spawn_pipes() -> void:
+	for px in PIPE_X:
+		var c := RigidBody3D.new()
+		c.mass = PIPE_MASS
+		var pm := PhysicsMaterial.new()
+		pm.friction = 0.7
+		pm.bounce = 0.08
+		c.physics_material_override = pm
+		c.continuous_cd = true
+		c.angular_damp_mode = RigidBody3D.DAMP_MODE_REPLACE
+		c.angular_damp = 1.6
+
+		var cs := CollisionShape3D.new()
+		var shape := CylinderShape3D.new()
+		shape.radius = PIPE_RADIUS
+		shape.height = PIPE_LENGTH
+		cs.shape = shape
+		# CylinderMesh/Shape default axis is Y; rotate 90° on X so it points along Z.
+		cs.rotation_degrees = Vector3(90, 0, 0)
+		c.add_child(cs)
+
+		var outer := MeshInstance3D.new()
+		var om := CylinderMesh.new()
+		om.top_radius = PIPE_RADIUS
+		om.bottom_radius = PIPE_RADIUS
+		om.height = PIPE_LENGTH
+		var outer_mat := _mat(STEEL, 0.9)
+		om.material = outer_mat
+		outer.mesh = om
+		outer.rotation_degrees = Vector3(90, 0, 0)
+		c.add_child(outer)
+		cargo_mats.append(outer_mat)
+
+		# Dark bore caps (both ends)
+		for ez in [PIPE_LENGTH * 0.5 + 0.001, -PIPE_LENGTH * 0.5 - 0.001]:
+			var cap := MeshInstance3D.new()
+			var cm := CylinderMesh.new()
+			cm.top_radius = PIPE_RADIUS * 0.88
+			cm.bottom_radius = PIPE_RADIUS * 0.88
+			cm.height = 0.04
+			cm.material = _mat(Color(0.05, 0.05, 0.06))
+			cap.mesh = cm
+			cap.rotation_degrees = Vector3(90, 0, 0)
+			cap.position = Vector3(0, 0, ez)
+			c.add_child(cap)
+
+		c.position = truck.transform * Vector3(px, 1.3, PIPE_Z_CENTER)
+		add_child(c)
+		cargo.append(c)
+
+
+func _build_racks() -> void:
+	# Permanent low cradles — short lips that stop the cargo from drifting even
+	# with racks off. These stay collidable regardless of _set_racks state.
+	# Attached to the truck so they move with it.
+	if cargo_kind == CARGO_PIPES:
+		for px in PIPE_X:
+			for dx in [0.33, -0.33]:
+				var lip := CollisionShape3D.new()
+				var lb := BoxShape3D.new()
+				lb.size = Vector3(0.08, 0.14, PIPE_LENGTH)
+				lip.shape = lb
+				lip.position = Vector3(px + dx, 1.0, PIPE_Z_CENTER)
+				truck.add_child(lip)
+				cradle_nodes.append(lip)
+				cradle_nodes.append(_box_mesh(lb.size, lip.position, Color(0.09, 0.09, 0.09), truck, 0.5))
+		# Backstops fore and aft so pipes don't slide out either end on brake/accel.
+		for sz in [PIPE_Z_CENTER - PIPE_LENGTH * 0.5 - 0.1, PIPE_Z_CENTER + PIPE_LENGTH * 0.5 + 0.1]:
+			var back := CollisionShape3D.new()
+			var rb := BoxShape3D.new()
+			rb.size = Vector3(2.5, 0.5, 0.15)
+			back.shape = rb
+			back.position = Vector3(0, 1.25, sz)
+			truck.add_child(back)
+			cradle_nodes.append(back)
+			cradle_nodes.append(_box_mesh(rb.size, back.position, Color(0.09, 0.09, 0.09), truck, 0.5))
+	else:
+		for z in COIL_Z:
+			for dz in [0.42, -0.42]:
+				var lip := CollisionShape3D.new()
+				var lb := BoxShape3D.new()
+				lb.size = Vector3(2.0, 0.1, 0.1)
+				lip.shape = lb
+				lip.position = Vector3(0, 0.9, z + dz)
+				truck.add_child(lip)
+				cradle_nodes.append(lip)
+				cradle_nodes.append(_box_mesh(lb.size, lip.position, Color(0.09, 0.09, 0.09), truck, 0.5))
+
+	# Tall chocks that are toggled by R. Visible + collidable only when racks_on.
+	if cargo_kind == CARGO_PIPES:
+		# Lateral chocks: for each pipe position, two chocks running lengthwise
+		# on left and right of the pipe. Chock size: thin X, moderate Y, long Z.
+		for px in PIPE_X:
+			for dx in [0.35, -0.35]:
+				var cs := CollisionShape3D.new()
+				var cb := BoxShape3D.new()
+				cb.size = Vector3(0.1, 0.35, PIPE_LENGTH)
+				cs.shape = cb
+				cs.position = Vector3(px + dx, 1.15, PIPE_Z_CENTER)
+				truck.add_child(cs)
+				chock_shapes.append(cs)
+				chock_meshes.append(_box_mesh(cb.size, cs.position, AMBER, truck))
+	else:
+		# Coil racks: fore/aft chocks per coil.
+		for z in COIL_Z:
+			for dz in [0.75, -0.75]:
+				var cs := CollisionShape3D.new()
+				var cb := BoxShape3D.new()
+				cb.size = Vector3(2.0, 0.35, 0.25)
+				cs.shape = cb
+				cs.position = Vector3(0, 1.025, z + dz)
+				truck.add_child(cs)
+				chock_shapes.append(cs)
+				chock_meshes.append(_box_mesh(cb.size, cs.position, AMBER, truck))
+
+
+func _reset_cargo() -> void:
+	# Unfreeze (delivery sets freeze=true), zero velocity, reset position +
+	# rotation, reset material. Works for both coils and pipes.
+	for i in range(cargo.size()):
+		var c := cargo[i]
+		if not is_instance_valid(c):
+			continue
+		c.freeze = false
 		c.linear_velocity = Vector3.ZERO
 		c.angular_velocity = Vector3.ZERO
-		c.position = truck.transform * Vector3(0, 1.57, COIL_Z[i])
+		if cargo_kind == CARGO_PIPES:
+			c.position = truck.transform * Vector3(PIPE_X[i], 1.3, PIPE_Z_CENTER)
+		else:
+			c.position = truck.transform * Vector3(0, 1.57, COIL_Z[i])
 		c.rotation = Vector3.ZERO
-		coil_mats[i].albedo_color = STEEL
-		coil_mats[i].emission_enabled = false
+		cargo_mats[i].albedo_color = STEEL
+		cargo_mats[i].emission_enabled = false
 
 
 func _reset_truck() -> void:
+	# VehicleBody3D's own velocity + transform setters don't always teleport
+	# cleanly after the body fell off the road. Push the transform directly
+	# into the physics server, which does.
+	var t := Transform3D(Basis.from_euler(Vector3(0, PI, 0)), Vector3(0, 0.7, 0))
 	truck.linear_velocity = Vector3.ZERO
 	truck.angular_velocity = Vector3.ZERO
-	truck.position = Vector3(0, 0.7, 0)
-	truck.rotation_degrees = Vector3(0, 180, 0)
 	truck.engine_force = 0.0
 	truck.brake = 0.0
 	truck.steering = 0.0
+	truck.global_transform = t
+	PhysicsServer3D.body_set_state(truck.get_rid(), PhysicsServer3D.BODY_STATE_TRANSFORM, t)
+	PhysicsServer3D.body_set_state(truck.get_rid(), PhysicsServer3D.BODY_STATE_LINEAR_VELOCITY, Vector3.ZERO)
+	PhysicsServer3D.body_set_state(truck.get_rid(), PhysicsServer3D.BODY_STATE_ANGULAR_VELOCITY, Vector3.ZERO)
 
 
 func _set_racks(on: bool) -> void:
@@ -582,12 +764,14 @@ func _build_hud() -> void:
 func _on_ui_draw() -> void:
 	_buttons.clear()
 	match state:
-		State.TITLE:    _dim(0.55); _draw_title()
-		State.HOW_TO:   _dim(0.6);  _draw_how_to()
-		State.PLAY:     _draw_hud()
-		State.PAUSE:    _dim(0.5);  _draw_pause()
-		State.SETTINGS: _dim(0.6);  _draw_settings()
-		State.RESULTS:  _dim(0.6);  _draw_results()
+		State.TITLE:      _dim(0.55); _draw_title()
+		State.HOW_TO:     _dim(0.6);  _draw_how_to()
+		State.PLAY:       _draw_hud()
+		State.PAUSE:      _dim(0.5);  _draw_pause()
+		State.SETTINGS:   _dim(0.6);  _draw_settings()
+		State.RESULTS:    _dim(0.6);  _draw_results()
+		State.SCORES:     _dim(0.65); _draw_scores()
+		State.NAME_ENTRY: _dim(0.7);  _draw_name_entry()
 
 
 func _dim(a: float) -> void:
@@ -607,6 +791,8 @@ func _apply_mode() -> void:
 
 
 func _reset_match() -> void:
+	# Cancel any pending finish→results transition.
+	finish_timer_id += 1
 	var m: Dictionary = MODES[mode_ix]
 	time_left = float(m.time)
 	finished = false
@@ -617,6 +803,9 @@ func _reset_match() -> void:
 	clean_stops = 0
 	delivery_t = 0.0
 	in_dock = false
+	racks_at_finish = false
+	final_score = 0
+	final_rank = -1
 	lost.clear()
 	delivered.clear()
 	shake = 0.0
@@ -628,9 +817,11 @@ func _reset_match() -> void:
 	cam_lead = Vector3.ZERO
 	prev_speed = 0.0
 	brake_coyote_t = 0.0
+	reset_grace_t = 0.5
 	_reset_truck()
-	_reset_coils()
-	_set_racks(false)
+	# Full respawn so delivered-and-frozen cargo comes back clean, and so
+	# switching cargo kind between runs rebuilds the racks correctly.
+	_spawn_cargo()
 	delivered_label.visible = false
 	_apply_mode()
 
@@ -640,6 +831,7 @@ func _begin_match() -> void:
 	_set_state(State.PLAY)
 	SFX.confirm()
 	best_cfg["last_mode"] = mode_ix
+	best_cfg["last_cargo"] = cargo_kind
 	_save_best()
 
 
@@ -650,6 +842,10 @@ func _restart_match() -> void:
 
 # ============================================================= input
 func _unhandled_input(event: InputEvent) -> void:
+	if event is InputEventMouseMotion:
+		mouse_pos = (event as InputEventMouseMotion).position
+		ui.queue_redraw()
+		return
 	if event is InputEventMouseButton and event.pressed and event.button_index == MOUSE_BUTTON_LEFT:
 		_handle_click(event.position)
 		return
@@ -665,10 +861,17 @@ func _unhandled_input(event: InputEvent) -> void:
 				elif event.physical_keycode in [KEY_1, KEY_2, KEY_3]:
 					mode_ix = event.physical_keycode - KEY_1
 					ui.queue_redraw()
+				elif event.physical_keycode == KEY_C:
+					cargo_kind = CARGO_PIPES if cargo_kind == CARGO_COILS else CARGO_COILS
+					_spawn_cargo()
+					SFX.click()
+					ui.queue_redraw()
+				elif event.physical_keycode == KEY_T:
+					_set_state(State.SCORES)
 			State.PLAY:
 				if finished:
 					if event.physical_keycode == KEY_ENTER:
-						_set_state(State.RESULTS)
+						_proceed_from_finish()
 				elif event.physical_keycode == KEY_ESCAPE or event.physical_keycode == KEY_P:
 					SFX.click()
 					_set_state(State.PAUSE)
@@ -691,6 +894,52 @@ func _unhandled_input(event: InputEvent) -> void:
 			State.RESULTS:
 				if event.physical_keycode == KEY_ENTER or event.physical_keycode == KEY_SPACE:
 					_set_state(State.TITLE)
+			State.SCORES:
+				if event.physical_keycode == KEY_ESCAPE or event.physical_keycode == KEY_ENTER:
+					SFX.click()
+					_set_state(State.TITLE)
+			State.NAME_ENTRY:
+				_handle_name_entry(event.physical_keycode)
+
+
+func _proceed_from_finish() -> void:
+	# When finished, the player hits Enter to see the results. If their score
+	# is a new high, go to the name entry card first.
+	if _score_qualifies(final_score):
+		_set_state(State.NAME_ENTRY)
+	else:
+		_set_state(State.RESULTS)
+
+
+func _handle_name_entry(key: int) -> void:
+	match key:
+		KEY_W, KEY_UP:
+			name_letters[name_pos] = (name_letters[name_pos] - 1 + 26) % 26
+			SFX.click()
+		KEY_S, KEY_DOWN:
+			name_letters[name_pos] = (name_letters[name_pos] + 1) % 26
+			SFX.click()
+		KEY_A, KEY_LEFT:
+			name_pos = (name_pos - 1 + 3) % 3
+			SFX.click()
+		KEY_D, KEY_RIGHT:
+			name_pos = (name_pos + 1) % 3
+			SFX.click()
+		KEY_ENTER, KEY_SPACE:
+			var nm := _name_string()
+			final_rank = _commit_score(nm, final_score)
+			SFX.confirm()
+			# Remember the name — handy for the next entry — but return cursor home.
+			name_pos = 0
+			_set_state(State.RESULTS)
+	ui.queue_redraw()
+
+
+func _name_string() -> String:
+	var s := ""
+	for n in name_letters:
+		s += char(int(n) + 65)
+	return s
 
 
 func _handle_click(pos: Vector2) -> void:
@@ -698,8 +947,6 @@ func _handle_click(pos: Vector2) -> void:
 		first_input_received = true
 		SFX.unlock_on_first_input()
 		controls_fade_t = 3.0
-	# Positions are in actual window coords; our UI draws in VIEW space (1280x720).
-	# canvas_items stretch scales for us — the Control.PRESET_FULL_RECT already matches.
 	for b in _buttons:
 		if (b.rect as Rect2).has_point(pos):
 			SFX.click()
@@ -712,15 +959,34 @@ func _on_button(id: String) -> void:
 		"play":   _begin_match()
 		"how_to": _set_state(State.HOW_TO)
 		"settings": _set_state(State.SETTINGS)
-		"mode_0": mode_ix = 0; ui.queue_redraw()
-		"mode_1": mode_ix = 1; ui.queue_redraw()
-		"mode_2": mode_ix = 2; ui.queue_redraw()
+		"scores": _set_state(State.SCORES)
+		"mode_0": mode_ix = 0; _save_best(); ui.queue_redraw()
+		"mode_1": mode_ix = 1; _save_best(); ui.queue_redraw()
+		"mode_2": mode_ix = 2; _save_best(); ui.queue_redraw()
+		"cargo_coils":
+			if cargo_kind != CARGO_COILS:
+				cargo_kind = CARGO_COILS
+				_spawn_cargo()
+				_save_best()
+				ui.queue_redraw()
+		"cargo_pipes":
+			if cargo_kind != CARGO_PIPES:
+				cargo_kind = CARGO_PIPES
+				_spawn_cargo()
+				_save_best()
+				ui.queue_redraw()
 		"resume": _set_state(State.PLAY)
 		"restart": _restart_match()
 		"settings_from_pause": _set_state(State.SETTINGS)
 		"quit_to_title": _set_state(State.TITLE)
 		"back": _set_state(state_prev)
+		"back_title": _set_state(State.TITLE)
 		"play_again": _set_state(State.TITLE)
+		"commit_name":
+			var nm := _name_string()
+			final_rank = _commit_score(nm, final_score)
+			SFX.confirm()
+			_set_state(State.RESULTS)
 		"mute_toggle":
 			settings.mute = not settings.mute
 			SFX.set_muted(settings.mute); UI.save_settings(settings)
@@ -746,27 +1012,33 @@ func _physics_process(delta: float) -> void:
 	if state != State.PLAY or finished:
 		return
 
+	if reset_grace_t > 0.0:
+		reset_grace_t = maxf(0.0, reset_grace_t - delta)
+
+	# Fall-off-the-road detect — instant death (after a short grace so a stale
+	# physics frame from the previous run can't trigger it)
+	if reset_grace_t <= 0.0 and truck.global_position.y < FALL_KILL_Y:
+		_finish(false, "WENT OFF THE ROAD")
+		return
+
 	var speed := truck.linear_velocity.length()
 	var throttle := Input.get_action_strength("accelerate") - Input.get_action_strength("reverse")
 	var steer_in := Input.get_action_strength("left") - Input.get_action_strength("right")
 	truck.steering = move_toward(truck.steering, steer_in * MAX_STEER, delta * 1.6)
 	truck.engine_force = throttle * ENGINE_FORCE if speed < MAX_SPEED else 0.0
 
-	# Brake coyote
 	if Input.is_action_just_pressed("brake"):
 		brake_coyote_t = BRAKE_COYOTE
 	brake_coyote_t = maxf(0.0, brake_coyote_t - delta)
 	var braking: bool = Input.is_action_pressed("brake") or brake_coyote_t > 0.0
 	truck.brake = BRAKE_FORCE if braking else 0.0
 
-	# Night Run crosswind — tiny but noticeable
 	var m: Dictionary = MODES[mode_ix]
 	var wind_m: float = float(m.wind)
 	if wind_m > 0.0:
 		var gust := wind_m * (0.6 + 0.4 * sin(Time.get_ticks_msec() * 0.0007))
 		truck.apply_central_force(Vector3(gust * 180.0, 0, 0))
 
-	# Racks toggle (one-shot)
 	if Input.is_action_just_pressed("racks"):
 		if speed < 1.0:
 			_set_racks(not racks_on)
@@ -780,9 +1052,9 @@ func _physics_process(delta: float) -> void:
 		else:
 			_banner("STOP to set racks", 1.0)
 
-	_check_coils()
+	if reset_grace_t <= 0.0:
+		_check_cargo()
 
-	# Clean-stop reward: hard decel + racks on + no coils lost in last beat
 	var decel := (prev_speed - speed) / maxf(delta, 0.0001)
 	if decel > CLEAN_STOP_DECEL and racks_on and speed < 2.0 and prev_speed > 10.0 and lost.is_empty():
 		clean_stops += 1
@@ -790,53 +1062,55 @@ func _physics_process(delta: float) -> void:
 	prev_speed = speed
 	prev_racks_on = racks_on
 
-	# Dock delivery ring
 	var dist := truck.global_position.distance_to(DOCK_POS)
 	in_dock = dist < 8.5 and speed < 2.2
-	var all_coils_on_deck := _coils_on_deck() == coils.size() - lost.size()
-	if in_dock and all_coils_on_deck and not lost.size() == coils.size():
+	var all_cargo_on_deck := _cargo_on_deck() == cargo.size() - lost.size()
+	if in_dock and all_cargo_on_deck and not lost.size() == cargo.size():
 		delivery_t = minf(DELIVERY_TIME, delivery_t + delta)
 		if delivery_t >= DELIVERY_TIME:
 			_do_delivery()
 	else:
 		delivery_t = maxf(0.0, delivery_t - delta * 2.0)
 
-	# Clock
 	time_left -= delta
 	elapsed += delta
 	if time_left <= 0.0:
 		time_left = 0.0
 		_finish(false, "OUT OF TIME")
-	elif lost.size() == coils.size():
-		_finish(false, "ALL COILS LOST")
+	elif lost.size() == cargo.size():
+		_finish(false, "ALL CARGO LOST")
 
 
-func _coils_on_deck() -> int:
+func _cargo_on_deck() -> int:
 	var n := 0
-	for c in coils:
+	for c in cargo:
 		if lost.has(c) or delivered.has(c):
 			continue
 		var p := truck.to_local(c.global_position)
-		if absf(p.x) < 1.8 and p.y > 0.6 and p.y < 3.5 and p.z > -5.2 and p.z < 2.6:
+		if _is_on_deck(p):
 			n += 1
 	return n
 
 
-func _check_coils() -> void:
-	var speed := truck.linear_velocity.length()
-	for i in range(coils.size()):
-		var c := coils[i]
+func _is_on_deck(p: Vector3) -> bool:
+	# Shared check for both cargo kinds. Pipes are 5m long centered at z=-1.1,
+	# so their center stays well inside z range [-5.2, 2.6] when on deck.
+	return absf(p.x) < 1.8 and p.y > 0.5 and p.y < 3.5 and p.z > -5.2 and p.z < 2.6
+
+
+func _check_cargo() -> void:
+	for i in range(cargo.size()):
+		var c := cargo[i]
 		if lost.has(c) or delivered.has(c):
 			continue
 		var p := truck.to_local(c.global_position)
-		var on_deck := absf(p.x) < 1.8 and p.y > 0.6 and p.y < 3.5 and p.z > -5.2 and p.z < 2.6
-		if not on_deck:
+		if not _is_on_deck(p):
 			lost[c] = true
-			coil_mats[i].albedo_color = LOST_RED
-			coil_mats[i].emission_enabled = true
-			coil_mats[i].emission = LOST_RED * 0.4
-			coil_mats[i].emission_energy_multiplier = 1.0
-			_banner("COIL LOST", 1.4)
+			cargo_mats[i].albedo_color = LOST_RED
+			cargo_mats[i].emission_enabled = true
+			cargo_mats[i].emission = LOST_RED * 0.4
+			cargo_mats[i].emission_energy_multiplier = 1.0
+			_banner("COIL LOST" if cargo_kind == CARGO_COILS else "PIPE LOST", 1.4)
 			_impact(10.0)
 			vignette_t = 0.6
 			SFX.fail()
@@ -862,20 +1136,20 @@ func _banner(t: String, dur: float) -> void:
 
 func _do_delivery() -> void:
 	var remaining: Array = []
-	for c in coils:
+	for c in cargo:
 		if not lost.has(c) and not delivered.has(c):
 			remaining.append(c)
 	if remaining.is_empty():
 		return
 	for c in remaining:
 		delivered[c] = true
-		# Fade coil out visually: send it to the dock
 		c.freeze = true
 		c.position = DOCK_POS + Vector3(rng.randf_range(-3, 3), 1.0 + rng.randf() * 0.5, rng.randf_range(-3, 3))
 	SFX.success()
 	SFX.kaching()
 	delivered_label.visible = true
-	get_tree().create_timer(1.6).timeout.connect(func(): if is_instance_valid(delivered_label): delivered_label.visible = false)
+	var tid := finish_timer_id
+	get_tree().create_timer(1.6).timeout.connect(func(): if tid == finish_timer_id and is_instance_valid(delivered_label): delivered_label.visible = false)
 	var any_lost := lost.size() > 0
 	_finish(true, "CLEAN LOAD" if not any_lost else "PARTIAL DELIVERY")
 
@@ -884,9 +1158,10 @@ func _finish(ok: bool, label: String) -> void:
 	if finished:
 		return
 	finished = true
+	racks_at_finish = racks_on
 	var m: Dictionary = MODES[mode_ix]
 	var any_lost := lost.size() > 0
-	var all_lost := lost.size() == coils.size()
+	var all_lost := lost.size() == cargo.size()
 	par_hit = ok and elapsed <= float(m.par) and not any_lost
 	if all_lost or not ok:
 		grade = 1
@@ -895,7 +1170,15 @@ func _finish(ok: bool, label: String) -> void:
 	else:
 		grade = 2
 	_banner(label, 2.0)
-	# Save best per mode
+
+	# Scoring: cargo delivered * 1000 + time_left seconds * 50 + racks bonus 100
+	var on_truck := cargo.size() - lost.size()
+	final_score = on_truck * 1000 + int(time_left) * 50 + (100 if racks_at_finish else 0)
+	# Grade multiplier so a 3-star run clearly beats a 2-star
+	final_score += (grade - 1) * 500
+	# Peek at rank — committed on name entry
+	final_rank = -1
+
 	var key := "mode_%d" % mode_ix
 	var row: Dictionary = best_cfg.get(key, {"grade": 0, "elapsed": 9999.0, "clean_stops": 0})
 	row.grade = maxi(int(row.grade), grade)
@@ -904,12 +1187,14 @@ func _finish(ok: bool, label: String) -> void:
 	row.clean_stops = maxi(int(row.clean_stops), clean_stops)
 	best_cfg[key] = row
 	_save_best()
-	get_tree().create_timer(1.4).timeout.connect(func(): if state == State.PLAY: _set_state(State.RESULTS))
+
+	# Capturing current timer id so a restart during the delay cancels it.
+	var tid := finish_timer_id
+	get_tree().create_timer(1.4).timeout.connect(func(): if tid == finish_timer_id and state == State.PLAY and finished: _proceed_from_finish())
 
 
 # ============================================================= per-frame
 func _process(delta: float) -> void:
-	# UI timers always run (even paused via ALWAYS process_mode on ui, but main here is ALWAYS too).
 	if banner_t > 0.0:
 		banner_t = maxf(0.0, banner_t - delta)
 		if banner_t <= 0.0:
@@ -919,7 +1204,6 @@ func _process(delta: float) -> void:
 	if controls_fade_t > 0.0:
 		controls_fade_t = maxf(0.0, controls_fade_t - delta)
 
-	# Shake decay
 	if shake_t > 0.0:
 		shake_t = maxf(0.0, shake_t - delta)
 		var k := shake_t / 0.4
@@ -933,7 +1217,6 @@ func _process(delta: float) -> void:
 		cam.h_offset = 0.0
 		cam.v_offset = 0.0
 
-	# Dock ring pulse
 	if dock_ring:
 		if settings.get("reduced_motion", false):
 			dock_ring.scale = Vector3.ONE
@@ -941,9 +1224,6 @@ func _process(delta: float) -> void:
 			var p := 1.0 + sin(Time.get_ticks_msec() * 0.004) * 0.07
 			dock_ring.scale = Vector3(p, 1.0, p)
 
-	# Camera: chase cam with speed-based lead + FOV lean.
-	# Truck yawed 180° on Y → its local +Z (direction of motion) is world -Z.
-	# truck.global_transform.basis.z gives that direction; follow from behind along -fwd.
 	if truck:
 		var fwd := truck.global_transform.basis.z
 		fwd.y = 0.0
@@ -959,7 +1239,6 @@ func _process(delta: float) -> void:
 		cam.global_position = cam.global_position.lerp(desired, 1.0 - exp(-delta * 4.0))
 		cam.look_at(target + Vector3.UP * 1.5, Vector3.UP)
 
-		# FOV widens 2° over 40mph (~17.9 m/s)
 		var mph := speed * 2.237
 		var target_fov := 65.0
 		if not settings.get("reduced_motion", false):
@@ -967,7 +1246,6 @@ func _process(delta: float) -> void:
 		fov_t = lerp(fov_t, target_fov, clampf(delta * 2.5, 0.0, 1.0))
 		cam.fov = fov_t
 
-		# Dust: emit when accelerating & grounded & moving
 		var accel_on := Input.get_action_strength("accelerate") > 0.1
 		var emit := accel_on and speed > 1.0 and state == State.PLAY and not finished
 		dust_l.emitting = emit
@@ -987,17 +1265,25 @@ func _text(pos: Vector2, s: String, size: int = UI.TYPE_BODY, color: Color = INK
 
 
 func _button(id: String, rect: Rect2, label: String, primary: bool = false, size: int = UI.TYPE_BODY) -> void:
-	var fill: Color = Color(AMBER.r, AMBER.g, AMBER.b, 0.22) if primary else UI.PANEL_FILL
-	var border: Color = Color(AMBER.r, AMBER.g, AMBER.b, 0.9) if primary else UI.PANEL_BORDER
+	var hover: bool = rect.has_point(mouse_pos)
+	var fill: Color
+	var border: Color
+	if primary:
+		fill = Color(AMBER.r, AMBER.g, AMBER.b, 0.32 if hover else 0.22)
+		border = Color(AMBER.r, AMBER.g, AMBER.b, 1.0 if hover else 0.9)
+	else:
+		fill = Color(1, 1, 1, 0.14 if hover else 0.06)
+		border = Color(1, 1, 1, 0.28 if hover else 0.14)
 	UI.draw_panel(ui, rect, 12.0, fill, border)
 	var tx: Vector2 = rect.position + Vector2(0, rect.size.y * 0.5 + size * 0.33)
-	_text(tx, label, size, INK, HORIZONTAL_ALIGNMENT_CENTER, rect.size.x, primary)
+	_text(tx, label, size, INK, HORIZONTAL_ALIGNMENT_CENTER, rect.size.x, primary or hover)
 	_buttons.append({"rect": rect, "id": id})
 
 
 func _toggle(id: String, pos: Vector2, label: String, on: bool) -> void:
 	var r := Rect2(pos, Vector2(500, 36))
-	UI.draw_panel(ui, r, 10.0, UI.PANEL_FILL, UI.PANEL_BORDER)
+	var hover: bool = r.has_point(mouse_pos)
+	UI.draw_panel(ui, r, 10.0, Color(1, 1, 1, 0.14 if hover else 0.06), Color(1, 1, 1, 0.26 if hover else 0.14))
 	var knob := Rect2(r.position + Vector2(r.size.x - 56, 6), Vector2(42, 24))
 	UI.draw_panel(ui, knob, 12.0, Color(AMBER.r, AMBER.g, AMBER.b, 0.9) if on else Color(1, 1, 1, 0.10), UI.PANEL_BORDER)
 	ui.draw_circle(knob.position + Vector2(30 if on else 12, 12), 9, INK)
@@ -1011,48 +1297,50 @@ func _draw_hud() -> void:
 	var mph := int(roundf(speed * 2.237))
 	var kph := int(roundf(speed * 3.6))
 
-	# Speed chip top-left
 	var sp_chip := Rect2(20, 20, 200, 92)
-	UI.draw_panel(ui, sp_chip, 14.0, Color(0, 0, 0, 0.35), UI.PANEL_BORDER)
-	_text(sp_chip.position + Vector2(18, 28), "SPEED", UI.TYPE_CAPTION, Color(INK, 0.6), HORIZONTAL_ALIGNMENT_LEFT, -1, true)
+	UI.draw_panel(ui, sp_chip, 14.0, Color(0, 0, 0, 0.45), UI.PANEL_BORDER)
+	_text(sp_chip.position + Vector2(18, 28), "SPEED", UI.TYPE_CAPTION, Color(INK, 0.75), HORIZONTAL_ALIGNMENT_LEFT, -1, true)
 	_text(sp_chip.position + Vector2(18, 70), "%d" % mph, UI.TYPE_HUD, INK, HORIZONTAL_ALIGNMENT_LEFT, -1, true, true)
-	_text(sp_chip.position + Vector2(118, 70), "MPH", UI.TYPE_CAPTION, Color(INK, 0.7), HORIZONTAL_ALIGNMENT_LEFT, -1, true)
-	_text(sp_chip.position + Vector2(118, 86), "%d km/h" % kph, UI.TYPE_CAPTION, Color(INK, 0.5))
+	_text(sp_chip.position + Vector2(118, 70), "MPH", UI.TYPE_CAPTION, Color(INK, 0.85), HORIZONTAL_ALIGNMENT_LEFT, -1, true)
+	_text(sp_chip.position + Vector2(118, 86), "%d km/h" % kph, UI.TYPE_CAPTION, Color(INK, 0.65))
 
-	# Clock + distance top-right
 	var cl_chip := Rect2(VIEW.x - 220, 20, 200, 92)
-	UI.draw_panel(ui, cl_chip, 14.0, Color(0, 0, 0, 0.35), UI.PANEL_BORDER)
-	_text(cl_chip.position + Vector2(cl_chip.size.x - 18, 28), "CLOCK", UI.TYPE_CAPTION, Color(INK, 0.6), HORIZONTAL_ALIGNMENT_RIGHT, -1, true)
+	UI.draw_panel(ui, cl_chip, 14.0, Color(0, 0, 0, 0.45), UI.PANEL_BORDER)
+	_text(cl_chip.position + Vector2(cl_chip.size.x - 18, 28), "CLOCK", UI.TYPE_CAPTION, Color(INK, 0.75), HORIZONTAL_ALIGNMENT_RIGHT, -1, true)
 	_text(cl_chip.position + Vector2(cl_chip.size.x - 18, 70), UI.mmss(time_left), UI.TYPE_HUD, INK, HORIZONTAL_ALIGNMENT_RIGHT, -1, true, true)
 	var dist := int(truck.global_position.distance_to(DOCK_POS)) if truck else 0
-	_text(cl_chip.position + Vector2(cl_chip.size.x - 18, 86), "DOCK %dm" % dist, UI.TYPE_CAPTION, Color(INK, 0.6), HORIZONTAL_ALIGNMENT_RIGHT)
+	_text(cl_chip.position + Vector2(cl_chip.size.x - 18, 86), "DOCK %dm" % dist, UI.TYPE_CAPTION, Color(INK, 0.75), HORIZONTAL_ALIGNMENT_RIGHT)
 
-	# Coil chip row (top-center)
-	var chip_w := 44.0 * coils.size() + 20.0
+	# Cargo chip row (top-center) — count varies by cargo kind
+	var cnt := cargo.size()
+	var chip_w: float = 44.0 * cnt + 24.0
 	var row := Rect2(VIEW.x * 0.5 - chip_w * 0.5, 20, chip_w, 44)
-	UI.draw_panel(ui, row, 14.0, Color(0, 0, 0, 0.35), UI.PANEL_BORDER)
-	for i in range(coils.size()):
-		var cx := row.position.x + 22 + i * 44.0
-		var cy := row.position.y + 22.0
+	UI.draw_panel(ui, row, 14.0, Color(0, 0, 0, 0.45), UI.PANEL_BORDER)
+	for i in range(cnt):
+		var cx: float = row.position.x + 22 + i * 44.0
+		var cy: float = row.position.y + 22.0
 		var color: Color
-		if delivered.has(coils[i]):
+		if delivered.has(cargo[i]):
 			color = DOCK_GREEN
-		elif lost.has(coils[i]):
+		elif lost.has(cargo[i]):
 			color = LOST_RED
 		else:
 			color = STEEL
-		ui.draw_circle(Vector2(cx, cy), 10.0, color)
-		ui.draw_arc(Vector2(cx, cy), 10.0, 0, TAU, 20, Color(0, 0, 0, 0.55), 1.5, true)
-		ui.draw_circle(Vector2(cx, cy), 3.0, Color(0.05, 0.05, 0.07))
+		if cargo_kind == CARGO_PIPES:
+			# Draw as a horizontal pill to signal "pipe"
+			var pr := Rect2(cx - 16, cy - 5, 32, 10)
+			UI.draw_panel(ui, pr, 5.0, color, Color(0, 0, 0, 0.55))
+		else:
+			ui.draw_circle(Vector2(cx, cy), 10.0, color)
+			ui.draw_arc(Vector2(cx, cy), 10.0, 0, TAU, 20, Color(0, 0, 0, 0.55), 1.5, true)
+			ui.draw_circle(Vector2(cx, cy), 3.0, Color(0.05, 0.05, 0.07))
 
-	# Mode name + clean-stops under coil row
-	var mode_label := "%s" % MODES[mode_ix].name
+	var mode_label := "%s · %s" % [MODES[mode_ix].name, "COILS" if cargo_kind == CARGO_COILS else "PIPES"]
 	if clean_stops > 0:
 		mode_label += " · %d CLEAN" % clean_stops
-	_text(Vector2(VIEW.x * 0.5, 86), mode_label, UI.TYPE_CAPTION, Color(INK, 0.7), HORIZONTAL_ALIGNMENT_CENTER)
+	_text(Vector2(VIEW.x * 0.5, 86), mode_label, UI.TYPE_CAPTION, Color(INK, 0.85), HORIZONTAL_ALIGNMENT_CENTER)
 
-	# Racks pill bottom-center
-	var pill_w := 240.0
+	var pill_w := 260.0
 	var pill := Rect2(VIEW.x * 0.5 - pill_w * 0.5, VIEW.y - 60, pill_w, 36)
 	var pill_fill: Color = Color(DOCK_GREEN.r, DOCK_GREEN.g, DOCK_GREEN.b, 0.22) if racks_on else Color(AMBER.r, AMBER.g, AMBER.b, 0.22)
 	var pill_border: Color = DOCK_GREEN if racks_on else AMBER
@@ -1060,7 +1348,6 @@ func _draw_hud() -> void:
 	var pill_text := "RACKS SET" if racks_on else "RACKS OFF · STOP + R"
 	_text(pill.position + Vector2(0, 24), pill_text, UI.TYPE_BODY, INK, HORIZONTAL_ALIGNMENT_CENTER, pill.size.x, true)
 
-	# Delivery ring (when in dock)
 	if delivery_t > 0.0:
 		var frac := delivery_t / DELIVERY_TIME
 		var center := Vector2(VIEW.x * 0.5, VIEW.y * 0.5 + 40)
@@ -1068,32 +1355,27 @@ func _draw_hud() -> void:
 		UI.draw_ring(ui, center, 60.0, frac, DOCK_GREEN, 6.0)
 		_text(Vector2(0, VIEW.y * 0.5 + 118), "DELIVERING", UI.TYPE_BODY, DOCK_GREEN, HORIZONTAL_ALIGNMENT_CENTER, VIEW.x, true)
 
-	# Red vignette flash on coil loss
 	if vignette_t > 0.0:
 		var a: float = clampf(vignette_t * 0.6, 0.0, 0.6)
 		_vignette(a)
 
-	# Banner
 	if banner_text != "":
 		var a: float = clampf(banner_t * 2.0, 0.0, 1.0)
 		var size: int = UI.TYPE_TITLE + 2
 		var bg_h := 70.0
 		var bg_y := VIEW.y * 0.42
-		ui.draw_rect(Rect2(0, bg_y, VIEW.x, bg_h), Color(0, 0, 0, 0.35 * a))
+		ui.draw_rect(Rect2(0, bg_y, VIEW.x, bg_h), Color(0, 0, 0, 0.4 * a))
 		_text(Vector2(0, bg_y + 48), banner_text, size, Color(INK.r, INK.g, INK.b, 0.75 + 0.25 * a), HORIZONTAL_ALIGNMENT_CENTER, VIEW.x, true, true)
 
-	# Finished banner
 	if finished:
-		_dim(0.35)
+		_dim(0.4)
 		_text(Vector2(0, VIEW.y * 0.5 - 8), banner_text if banner_text != "" else "RUN COMPLETE", UI.TYPE_TITLE, INK, HORIZONTAL_ALIGNMENT_CENTER, VIEW.x, true, true)
-		_text(Vector2(0, VIEW.y * 0.5 + 24), "ENTER for results", UI.TYPE_BODY, Color(INK, 0.7), HORIZONTAL_ALIGNMENT_CENTER, VIEW.x)
+		_text(Vector2(0, VIEW.y * 0.5 + 24), "ENTER for results", UI.TYPE_BODY, Color(INK, 0.85), HORIZONTAL_ALIGNMENT_CENTER, VIEW.x)
 
-	# Controls hint
 	_draw_controls_hint()
 
 
 func _vignette(a: float) -> void:
-	# 4 red bands fading inward.
 	var layers := 6
 	for i in range(layers):
 		var t: float = float(i) / layers
@@ -1124,33 +1406,52 @@ func _draw_controls_hint() -> void:
 	for c in chips:
 		var w: float = font_regular.get_string_size(c, HORIZONTAL_ALIGNMENT_LEFT, -1, UI.TYPE_CAPTION).x + 20
 		var r := Rect2(x, y, w, 22)
-		UI.draw_panel(ui, r, 10.0, Color(1, 1, 1, 0.08 * alpha), Color(1, 1, 1, 0.15 * alpha))
+		UI.draw_panel(ui, r, 10.0, Color(0, 0, 0, 0.35 * alpha), Color(1, 1, 1, 0.2 * alpha))
 		_text(Vector2(x + 10, y + 15), c, UI.TYPE_CAPTION, Color(INK.r, INK.g, INK.b, alpha), HORIZONTAL_ALIGNMENT_LEFT, -1, true)
 		x += w + 8
 
 
 # ---- title -----------------------------------------------------------------
 func _draw_title() -> void:
-	var card := Rect2(80, 90, 560, 480)
+	var card := Rect2(80, 70, 560, 580)
 	UI.draw_card(ui, card, AMBER)
-	_text(card.position + Vector2(28, 60), "FLATBED HAULER", UI.TYPE_TITLE + 8, INK, HORIZONTAL_ALIGNMENT_LEFT, -1, true, true)
-	_text(card.position + Vector2(28, 92), "4 coils to the dock.", UI.TYPE_BODY, Color(INK, 0.8))
+	_text(card.position + Vector2(28, 56), "FLATBED HAULER", UI.TYPE_TITLE + 6, INK, HORIZONTAL_ALIGNMENT_LEFT, -1, true, true)
+	_text(card.position + Vector2(28, 86), "Steel from the mill to the dock.", UI.TYPE_BODY, Color(INK, 0.85))
 
-	_text(card.position + Vector2(28, 136), "MODE", UI.TYPE_CAPTION, Color(INK, 0.6), HORIZONTAL_ALIGNMENT_LEFT, -1, true)
+	# Route
+	_text(card.position + Vector2(28, 126), "ROUTE", UI.TYPE_CAPTION, Color(INK, 0.75), HORIZONTAL_ALIGNMENT_LEFT, -1, true)
 	for i in range(MODES.size()):
-		var r := Rect2(card.position.x + 28 + i * 170, card.position.y + 156, 160, 72)
+		var r := Rect2(card.position.x + 28 + i * 170, card.position.y + 146, 160, 72)
 		var sel: bool = i == mode_ix
-		var fill: Color = Color(AMBER.r, AMBER.g, AMBER.b, 0.20) if sel else UI.PANEL_FILL
-		var bor: Color = Color(AMBER.r, AMBER.g, AMBER.b, 0.9) if sel else UI.PANEL_BORDER
+		var hover: bool = r.has_point(mouse_pos)
+		var fill: Color = Color(AMBER.r, AMBER.g, AMBER.b, 0.26 if sel else (0.14 if hover else 0.06))
+		var bor: Color = Color(AMBER.r, AMBER.g, AMBER.b, 1.0 if sel else (0.5 if hover else 0.2))
 		UI.draw_panel(ui, r, 10.0, fill, bor)
-		_text(r.position + Vector2(0, 26), MODES[i].name, UI.TYPE_BODY, INK, HORIZONTAL_ALIGNMENT_CENTER, r.size.x, sel)
-		_text(r.position + Vector2(10, 48), MODES[i].subtitle, UI.TYPE_CAPTION, Color(INK, 0.6), HORIZONTAL_ALIGNMENT_LEFT, r.size.x - 20)
+		_text(r.position + Vector2(0, 26), MODES[i].name, UI.TYPE_BODY, INK, HORIZONTAL_ALIGNMENT_CENTER, r.size.x, sel or hover)
+		_text(r.position + Vector2(10, 48), MODES[i].subtitle, UI.TYPE_CAPTION, Color(INK, 0.75), HORIZONTAL_ALIGNMENT_LEFT, r.size.x - 20)
 		_buttons.append({"rect": r, "id": "mode_%d" % i})
 
-	var by: float = card.position.y + 260
+	# Cargo selector
+	_text(card.position + Vector2(28, 238), "CARGO", UI.TYPE_CAPTION, Color(INK, 0.75), HORIZONTAL_ALIGNMENT_LEFT, -1, true)
+	var cargos := [["cargo_coils", "COILS", "4 across · roll fore/aft", CARGO_COILS],
+				   ["cargo_pipes", "PIPES", "3 long · roll side to side", CARGO_PIPES]]
+	for i in range(cargos.size()):
+		var cr := Rect2(card.position.x + 28 + i * 250, card.position.y + 258, 240, 68)
+		var sel: bool = cargo_kind == cargos[i][3]
+		var hover: bool = cr.has_point(mouse_pos)
+		var fill: Color = Color(SKY.r, SKY.g, SKY.b, 0.26 if sel else (0.14 if hover else 0.06))
+		var bor: Color = Color(SKY.r, SKY.g, SKY.b, 1.0 if sel else (0.5 if hover else 0.2))
+		UI.draw_panel(ui, cr, 10.0, fill, bor)
+		_text(cr.position + Vector2(0, 26), cargos[i][1], UI.TYPE_BODY, INK, HORIZONTAL_ALIGNMENT_CENTER, cr.size.x, sel or hover)
+		_text(cr.position + Vector2(10, 48), cargos[i][2], UI.TYPE_CAPTION, Color(INK, 0.75), HORIZONTAL_ALIGNMENT_LEFT, cr.size.x - 20)
+		_buttons.append({"rect": cr, "id": cargos[i][0]})
+
+	# Buttons
+	var by: float = card.position.y + 346
 	_button("play",     Rect2(card.position.x + 28,  by, 220, 54), "Play", true, UI.TYPE_HEADLINE)
-	_button("how_to",   Rect2(card.position.x + 264, by, 160, 54), "How to play")
-	_button("settings", Rect2(card.position.x + 28,  by + 72, 160, 44), "Settings")
+	_button("scores",   Rect2(card.position.x + 264, by, 220, 54), "High scores")
+	_button("how_to",   Rect2(card.position.x + 28,  by + 72, 220, 44), "How to play")
+	_button("settings", Rect2(card.position.x + 264, by + 72, 220, 44), "Settings")
 
 	var row: Dictionary = best_cfg.get("mode_%d" % mode_ix, {})
 	if not row.is_empty():
@@ -1159,30 +1460,31 @@ func _draw_title() -> void:
 		var line := "Best · "
 		if best_t > 0.0:
 			line += UI.mmss(best_t) + " · "
-		line += "%d★" % g
-		_text(card.position + Vector2(28, 420), line, UI.TYPE_CAPTION, Color(INK, 0.7))
+		line += "%d star" % g
+		_text(card.position + Vector2(28, 500), line, UI.TYPE_CAPTION, Color(INK, 0.8))
 
 	# Right info card
-	var info := Rect2(680, 90, 520, 410)
+	var info := Rect2(680, 70, 520, 440)
 	UI.draw_panel(ui, info)
-	_text(info.position + Vector2(24, 36), "WHAT THIS SHOWS", UI.TYPE_CAPTION, Color(INK, 0.6), HORIZONTAL_ALIGNMENT_LEFT, -1, true)
+	_text(info.position + Vector2(24, 36), "WHAT THIS SHOWS", UI.TYPE_CAPTION, Color(INK, 0.75), HORIZONTAL_ALIGNMENT_LEFT, -1, true)
 	var bullets := [
 		"VehicleBody3D truck, 6 wheels, tandem drive.",
-		"4 steel coils roll on hard braking and bumps.",
-		"R sets coil racks when stopped. -5 seconds.",
+		"Coils roll fore/aft. Pipes roll side to side.",
+		"R sets cargo racks when stopped. -5 seconds.",
 		"Dock delivery holds for a beat, then counts.",
 		"Night Run drops friction and adds crosswind.",
-		"Procedural audio, headlights, dust.",
+		"Fall off the road and the run is done.",
+		"Top 10 saved per route and cargo.",
 	]
 	var yy: float = info.position.y + 70
 	for b in bullets:
 		_text(Vector2(info.position.x + 24, yy), "·  " + b, UI.TYPE_BODY, INK, HORIZONTAL_ALIGNMENT_LEFT, info.size.x - 48)
 		yy += 28
 
-	# Driver note
-	var note := Rect2(80, VIEW.y - 86, VIEW.x - 160, 56)
-	UI.draw_panel(ui, note, 10.0, Color(1, 1, 1, 0.04), Color(1, 1, 1, 0.10))
-	_text(note.position + Vector2(0, 32), "Rolling steel, headboard physics, coil racks. Everything simulated in VehicleBody3D.", UI.TYPE_CAPTION, Color(INK, 0.7), HORIZONTAL_ALIGNMENT_CENTER, note.size.x)
+	var note := Rect2(680, 530, 520, 110)
+	UI.draw_panel(ui, note, 10.0, Color(1, 1, 1, 0.04), Color(1, 1, 1, 0.14))
+	_text(note.position + Vector2(0, 36), "C swaps cargo. T opens high scores.", UI.TYPE_CAPTION, Color(INK, 0.8), HORIZONTAL_ALIGNMENT_CENTER, note.size.x, true)
+	_text(note.position + Vector2(0, 66), "Rolling steel, headboard physics, cargo racks.", UI.TYPE_CAPTION, Color(INK, 0.7), HORIZONTAL_ALIGNMENT_CENTER, note.size.x)
 
 
 # ---- how to ----------------------------------------------------------------
@@ -1192,10 +1494,11 @@ func _draw_how_to() -> void:
 	_text(r.position + Vector2(28, 54), "HOW TO HAUL", UI.TYPE_TITLE, INK, HORIZONTAL_ALIGNMENT_LEFT, -1, true, true)
 	var lines := [
 		"W or S drive. A or D steer. SPACE brakes.",
-		"Stop the truck and press R to set coil racks. Takes 5 seconds off the clock.",
-		"Hard stops, speed bumps and the chicane will roll your coils if the racks are off.",
+		"Stop the truck and press R to set cargo racks. Takes 5 seconds off the clock.",
+		"Hard stops, speed bumps and the chicane will roll your cargo if the racks are off.",
+		"Coils roll fore and aft. Pipes roll side to side. Pick your poison on the title.",
 		"Pull up on the green dock pad and hold still. The ring fills in 1.2s.",
-		"Deliver all 4 and beat par for 3 stars. A lost coil is a claim.",
+		"Fall off the road and the run is done.",
 		"H sounds the horn. ESC pauses. Reduced motion is in Settings.",
 	]
 	var yy: float = r.position.y + 110
@@ -1228,7 +1531,7 @@ func _draw_settings() -> void:
 	var bar := Rect2(r.position.x + 118, r.position.y + 136, 300, 10)
 	UI.draw_panel(ui, bar, 5.0, Color(1, 1, 1, 0.08), Color(1, 1, 1, 0.14))
 	ui.draw_rect(Rect2(bar.position, Vector2(bar.size.x * settings.volume, bar.size.y)), AMBER)
-	_text(Vector2(r.position.x + 428, r.position.y + 148), "%d%%" % int(settings.volume * 100), UI.TYPE_CAPTION, Color(INK, 0.7), HORIZONTAL_ALIGNMENT_LEFT, -1, true, true)
+	_text(Vector2(r.position.x + 428, r.position.y + 148), "%d%%" % int(settings.volume * 100), UI.TYPE_CAPTION, Color(INK, 0.85), HORIZONTAL_ALIGNMENT_LEFT, -1, true, true)
 
 	_toggle("mute_toggle",    r.position + Vector2(28, 180), "Mute all audio", settings.mute)
 	_toggle("reduced_motion", r.position + Vector2(28, 230), "Reduced motion", settings.reduced_motion)
@@ -1240,40 +1543,50 @@ func _draw_settings() -> void:
 
 # ---- results ---------------------------------------------------------------
 func _draw_results() -> void:
-	var r := Rect2(260, 80, 760, 560)
+	var r := Rect2(260, 60, 760, 600)
 	UI.draw_card(ui, r, AMBER)
 	var title: String
 	match grade:
 		3: title = "CLEAN LOAD"
 		2: title = "GOOD RUN"
 		_: title = "SHORT HAUL"
-	_text(r.position + Vector2(0, 72), title, UI.TYPE_TITLE + 6, INK, HORIZONTAL_ALIGNMENT_CENTER, r.size.x, true, true)
+	_text(r.position + Vector2(0, 68), title, UI.TYPE_TITLE + 4, INK, HORIZONTAL_ALIGNMENT_CENTER, r.size.x, true, true)
+
+	# Rank banner if placed
+	if final_rank > 0:
+		var rank_bg := Rect2(r.position.x + 180, r.position.y + 100, r.size.x - 360, 40)
+		var is_top := final_rank == 1
+		var bgf: Color = Color(DOCK_GREEN.r, DOCK_GREEN.g, DOCK_GREEN.b, 0.28) if is_top else Color(AMBER.r, AMBER.g, AMBER.b, 0.22)
+		var bgb: Color = DOCK_GREEN if is_top else AMBER
+		UI.draw_panel(ui, rank_bg, 8.0, bgf, bgb)
+		var rtxt := "NEW HIGH SCORE" if is_top else "RANK %02d" % final_rank
+		_text(rank_bg.position + Vector2(0, 28), rtxt, UI.TYPE_BODY, INK, HORIZONTAL_ALIGNMENT_CENTER, rank_bg.size.x, true, true)
 
 	# Stars
 	var sx: float = r.position.x + r.size.x * 0.5 - 60
 	for i in range(3):
 		var filled: bool = i < grade
-		var col: Color = AMBER if filled else Color(INK, 0.3)
-		_draw_star(Vector2(sx + i * 50, r.position.y + 128), 18.0, col, filled)
+		var col: Color = AMBER if filled else Color(INK, 0.35)
+		_draw_star(Vector2(sx + i * 50, r.position.y + 170), 18.0, col, filled)
 
-	var cy: float = r.position.y + 190
-	var on_truck := coils.size() - lost.size()
+	var cy: float = r.position.y + 220
+	var on_truck := cargo.size() - lost.size()
 	var m: Dictionary = MODES[mode_ix]
-	_text(Vector2(r.position.x, cy),       "%d / %d coils delivered" % [on_truck, coils.size()], UI.TYPE_HEADLINE, INK, HORIZONTAL_ALIGNMENT_CENTER, r.size.x, true, true)
-	_text(Vector2(r.position.x, cy + 40),  "Time %s · par %s" % [UI.mmss(elapsed), UI.mmss(float(m.par))], UI.TYPE_BODY, Color(INK, 0.8), HORIZONTAL_ALIGNMENT_CENTER, r.size.x, false, true)
-	_text(Vector2(r.position.x, cy + 68),  "Clean stops %d" % clean_stops, UI.TYPE_BODY, Color(INK, 0.8), HORIZONTAL_ALIGNMENT_CENTER, r.size.x, false, true)
-	_text(Vector2(r.position.x, cy + 100), "Mode · %s" % MODES[mode_ix].name, UI.TYPE_CAPTION, Color(INK, 0.6), HORIZONTAL_ALIGNMENT_CENTER, r.size.x)
+	var delivered_n := delivered.size()
+	var kind_label := "coils" if cargo_kind == CARGO_COILS else "pipes"
+	var line := "%d / %d %s delivered" % [delivered_n, cargo.size(), kind_label]
+	if delivered_n == 0 and lost.size() < cargo.size():
+		line = "%d / %d %s still on truck" % [on_truck, cargo.size(), kind_label]
+	_text(Vector2(r.position.x, cy),       line, UI.TYPE_HEADLINE, INK, HORIZONTAL_ALIGNMENT_CENTER, r.size.x, true, true)
+	_text(Vector2(r.position.x, cy + 40),  "Time %s · par %s" % [UI.mmss(elapsed), UI.mmss(float(m.par))], UI.TYPE_BODY, Color(INK, 0.85), HORIZONTAL_ALIGNMENT_CENTER, r.size.x, false, true)
+	_text(Vector2(r.position.x, cy + 68),  "Clean stops %d · racks %s" % [clean_stops, "set" if racks_at_finish else "off"], UI.TYPE_BODY, Color(INK, 0.85), HORIZONTAL_ALIGNMENT_CENTER, r.size.x, false, true)
+	_text(Vector2(r.position.x, cy + 96),  "Route · %s · %s" % [MODES[mode_ix].name, "COILS" if cargo_kind == CARGO_COILS else "PIPES"], UI.TYPE_CAPTION, Color(INK, 0.7), HORIZONTAL_ALIGNMENT_CENTER, r.size.x)
 
-	var row: Dictionary = best_cfg.get("mode_%d" % mode_ix, {})
-	if not row.is_empty():
-		var best_t := float(row.get("elapsed", 0.0))
-		var g := int(row.get("grade", 0))
-		var cs := int(row.get("clean_stops", 0))
-		var line := "Best · "
-		if best_t > 0.0:
-			line += UI.mmss(best_t) + " · "
-		line += "%d★ · clean %d" % [g, cs]
-		_text(Vector2(r.position.x, cy + 134), line, UI.TYPE_CAPTION, Color(INK, 0.6), HORIZONTAL_ALIGNMENT_CENTER, r.size.x)
+	# Score tile
+	var st := Rect2(r.position.x + r.size.x * 0.5 - 180, cy + 130, 360, 72)
+	UI.draw_panel(ui, st, 12.0, Color(0, 0, 0, 0.35), UI.PANEL_BORDER)
+	_text(st.position + Vector2(0, 28), "SCORE", UI.TYPE_CAPTION, Color(INK, 0.75), HORIZONTAL_ALIGNMENT_CENTER, st.size.x, true)
+	_text(st.position + Vector2(0, 58), "%08d" % final_score, UI.TYPE_HEADLINE, AMBER, HORIZONTAL_ALIGNMENT_CENTER, st.size.x, true, true)
 
 	_button("restart",    Rect2(r.position.x + r.size.x * 0.5 - 230, r.position.y + r.size.y - 86, 200, 50), "Run it again", true)
 	_button("play_again", Rect2(r.position.x + r.size.x * 0.5 + 30,  r.position.y + r.size.y - 86, 200, 50), "Back to title")
@@ -1292,13 +1605,84 @@ func _draw_star(center: Vector2, r: float, color: Color, filled: bool) -> void:
 		ui.draw_polyline(pts, color, 1.5, true)
 
 
-# ============================================================= save/load
+# ---- high scores -----------------------------------------------------------
+func _draw_scores() -> void:
+	var r := Rect2(280, 60, 720, 600)
+	# Arcade-flavoured translucent panel with faint scanline texture
+	UI.draw_panel(ui, r, 14.0, Color(0.02, 0.03, 0.05, 0.78), Color(AMBER.r, AMBER.g, AMBER.b, 0.6))
+	# Scanlines
+	for y in range(int(r.position.y) + 6, int(r.position.y + r.size.y) - 6, 3):
+		ui.draw_rect(Rect2(r.position.x + 6, y, r.size.x - 12, 1), Color(1, 1, 1, 0.03))
+
+	_text(r.position + Vector2(0, 64), "HIGH SCORES", UI.TYPE_TITLE + 4, AMBER, HORIZONTAL_ALIGNMENT_CENTER, r.size.x, true, true)
+	var sub := "%s · %s" % [MODES[mode_ix].name.to_upper(), "COILS" if cargo_kind == CARGO_COILS else "PIPES"]
+	_text(r.position + Vector2(0, 92), sub, UI.TYPE_CAPTION, Color(INK, 0.85), HORIZONTAL_ALIGNMENT_CENTER, r.size.x, true, true)
+
+	# Column headers
+	var hx: float = r.position.x + 60
+	var hy: float = r.position.y + 128
+	_text(Vector2(hx, hy),       "RANK", UI.TYPE_CAPTION, Color(INK, 0.65), HORIZONTAL_ALIGNMENT_LEFT, -1, true)
+	_text(Vector2(hx + 90, hy),  "NAME", UI.TYPE_CAPTION, Color(INK, 0.65), HORIZONTAL_ALIGNMENT_LEFT, -1, true)
+	_text(Vector2(r.position.x + r.size.x - 60, hy), "SCORE", UI.TYPE_CAPTION, Color(INK, 0.65), HORIZONTAL_ALIGNMENT_RIGHT, -1, true)
+	ui.draw_rect(Rect2(r.position.x + 50, hy + 10, r.size.x - 100, 1), Color(AMBER.r, AMBER.g, AMBER.b, 0.35))
+
+	var entries := _scores_for_current()
+	var row_y: float = hy + 24
+	for i in range(10):
+		var e: Dictionary = entries[i] if i < entries.size() else {}
+		var rank_text := "%02d" % (i + 1)
+		var name_text := String(e.get("name", "---")) if not e.is_empty() else "---"
+		var score_text := "%08d" % int(e.get("score", 0)) if not e.is_empty() else "--------"
+		var col: Color = AMBER if (final_rank == i + 1) else INK
+		_text(Vector2(hx, row_y + 22),       rank_text, UI.TYPE_HEADLINE, col, HORIZONTAL_ALIGNMENT_LEFT, -1, true, true)
+		_text(Vector2(hx + 90, row_y + 22),  name_text, UI.TYPE_HEADLINE, col, HORIZONTAL_ALIGNMENT_LEFT, -1, true, true)
+		_text(Vector2(r.position.x + r.size.x - 60, row_y + 22), score_text, UI.TYPE_HEADLINE, col, HORIZONTAL_ALIGNMENT_RIGHT, -1, true, true)
+		row_y += 32
+
+	_button("back_title", Rect2(r.position.x + r.size.x * 0.5 - 100, r.position.y + r.size.y - 66, 200, 46), "Back", true)
+
+
+# ---- name entry (arcade) --------------------------------------------------
+func _draw_name_entry() -> void:
+	var r := Rect2(VIEW.x * 0.5 - 300, 160, 600, 380)
+	UI.draw_panel(ui, r, 14.0, Color(0.02, 0.03, 0.05, 0.85), Color(DOCK_GREEN.r, DOCK_GREEN.g, DOCK_GREEN.b, 0.7))
+	for y in range(int(r.position.y) + 6, int(r.position.y + r.size.y) - 6, 3):
+		ui.draw_rect(Rect2(r.position.x + 6, y, r.size.x - 12, 1), Color(1, 1, 1, 0.03))
+
+	_text(r.position + Vector2(0, 56), "NEW HIGH SCORE", UI.TYPE_TITLE, DOCK_GREEN, HORIZONTAL_ALIGNMENT_CENTER, r.size.x, true, true)
+	_text(r.position + Vector2(0, 86), "SCORE %08d" % final_score, UI.TYPE_HEADLINE, AMBER, HORIZONTAL_ALIGNMENT_CENTER, r.size.x, true, true)
+
+	# Three letter cells
+	var cell_w := 100.0
+	var gap := 20.0
+	var total := cell_w * 3 + gap * 2
+	var start_x := r.position.x + (r.size.x - total) * 0.5
+	var cy: float = r.position.y + 160
+	for i in range(3):
+		var cx := start_x + i * (cell_w + gap)
+		var cr := Rect2(cx, cy, cell_w, 110)
+		var sel: bool = i == name_pos
+		var fill: Color = Color(DOCK_GREEN.r, DOCK_GREEN.g, DOCK_GREEN.b, 0.26) if sel else Color(1, 1, 1, 0.06)
+		var bor: Color = DOCK_GREEN if sel else Color(1, 1, 1, 0.22)
+		UI.draw_panel(ui, cr, 10.0, fill, bor)
+		var ch := char(int(name_letters[i]) + 65)
+		_text(cr.position + Vector2(0, 82), ch, UI.TYPE_HUD + 10, INK, HORIZONTAL_ALIGNMENT_CENTER, cr.size.x, true, true)
+		if sel:
+			# chevrons
+			_text(Vector2(cx, cy - 6), "^", UI.TYPE_HEADLINE, DOCK_GREEN, HORIZONTAL_ALIGNMENT_CENTER, cell_w, true, true)
+			_text(Vector2(cx, cy + cr.size.y + 24), "v", UI.TYPE_HEADLINE, DOCK_GREEN, HORIZONTAL_ALIGNMENT_CENTER, cell_w, true, true)
+
+	_text(r.position + Vector2(0, r.size.y - 50), "W/S letter   A/D column   ENTER commit", UI.TYPE_CAPTION, Color(INK, 0.8), HORIZONTAL_ALIGNMENT_CENTER, r.size.x, true, true)
+
+
+# ============================================================= save/load (best)
 func _load_best() -> Dictionary:
 	var cfg := ConfigFile.new()
-	var out := {"last_mode": 1}
+	var out := {"last_mode": 1, "last_cargo": CARGO_COILS}
 	if cfg.load("user://flatbed_best.cfg") != OK:
 		return out
 	out["last_mode"] = cfg.get_value("meta", "last_mode", 1)
+	out["last_cargo"] = cfg.get_value("meta", "last_cargo", CARGO_COILS)
 	for i in range(MODES.size()):
 		var key := "mode_%d" % i
 		if cfg.has_section(key):
@@ -1313,6 +1697,7 @@ func _load_best() -> Dictionary:
 func _save_best() -> void:
 	var cfg := ConfigFile.new()
 	cfg.set_value("meta", "last_mode", int(best_cfg.get("last_mode", 1)))
+	cfg.set_value("meta", "last_cargo", String(best_cfg.get("last_cargo", CARGO_COILS)))
 	for i in range(MODES.size()):
 		var key := "mode_%d" % i
 		if best_cfg.has(key):
@@ -1321,3 +1706,70 @@ func _save_best() -> void:
 			cfg.set_value(key, "elapsed", float(row.get("elapsed", 0.0)))
 			cfg.set_value(key, "clean_stops", int(row.get("clean_stops", 0)))
 	cfg.save("user://flatbed_best.cfg")
+
+
+# ============================================================= save/load (scores)
+func _scores_key(mode: int, cargo: String) -> String:
+	return "route%d_%s" % [mode, cargo]
+
+
+func _load_scores() -> Dictionary:
+	var out: Dictionary = {}
+	var cfg := ConfigFile.new()
+	if cfg.load("user://flatbed_scores.cfg") != OK:
+		return out
+	for section in cfg.get_sections():
+		var arr: Array = []
+		for i in range(10):
+			var key := "r%d" % i
+			if cfg.has_section_key(section, key):
+				var v: Dictionary = cfg.get_value(section, key, {})
+				if not v.is_empty():
+					arr.append(v)
+		out[section] = arr
+	return out
+
+
+func _save_scores() -> void:
+	var cfg := ConfigFile.new()
+	for section in scores_cfg.keys():
+		var arr: Array = scores_cfg[section]
+		for i in range(arr.size()):
+			cfg.set_value(section, "r%d" % i, arr[i])
+	cfg.save("user://flatbed_scores.cfg")
+
+
+func _scores_for_current() -> Array:
+	return scores_cfg.get(_scores_key(mode_ix, cargo_kind), [])
+
+
+func _score_qualifies(score: int) -> bool:
+	if score <= 0:
+		return false
+	var arr: Array = _scores_for_current()
+	if arr.size() < 10:
+		return true
+	return score > int(arr[arr.size() - 1].get("score", 0))
+
+
+func _commit_score(nm: String, score: int) -> int:
+	# Returns 1-based rank, or -1 if not placed.
+	var key := _scores_key(mode_ix, cargo_kind)
+	var arr: Array = scores_cfg.get(key, []).duplicate()
+	var entry := {
+		"name": nm,
+		"score": score,
+		"cargo": cargo_kind,
+		"racks": racks_at_finish,
+		"time": float(elapsed),
+	}
+	arr.append(entry)
+	arr.sort_custom(func(a, b): return int(a.get("score", 0)) > int(b.get("score", 0)))
+	if arr.size() > 10:
+		arr.resize(10)
+	scores_cfg[key] = arr
+	_save_scores()
+	for i in range(arr.size()):
+		if arr[i] == entry:
+			return i + 1
+	return -1
